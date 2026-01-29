@@ -1,0 +1,24 @@
+providers:
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: YOUR_KEY
+
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: YOUR_KEY
+
+  groq:
+    base_url: https://api.groq.com/openai/v1
+    api_key: YOUR_KEY
+
+  ollama:
+    base_url: http://localhost:11434/v1
+
+models:
+  openai/gpt-4.1:
+    reasoning_effort: high
+    verbosity: medium
+
+  openrouter/x-ai/grok-4-fast:online: {}
+
+  ollama/llama4: {}
