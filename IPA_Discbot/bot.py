@@ -35,8 +35,15 @@ DB_PATH = "bot.db"  # database path
 # conv role
 # msg content
 
+def _db_connect():
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL;") # Readers and writers can’t operate simultaneously
+    con.execute("PRAGMA synchronous=NORMAL;") # Controls how aggressively SQLite syncs to disk
+    con.execute("PRAGMA foreign_keys=ON;")
+    return con
+
 def init_db():
-    con = sqlite3.connect(DB_PATH)  # open / create database
+    con = _db_connect()  # open / create database
     cur = con.cursor()              # cursor for executing SQL
 
     cur.executescript("""
@@ -69,7 +76,7 @@ def init_db():
 
 
 def log_message(channel_id: int, user_id: int, role: str, content: str, guild_id: int | None):  # conv. logging for specific user
-    con = sqlite3.connect(DB_PATH)
+    con = _db_connect()
     cur = con.cursor()
     cur.execute(
         "INSERT INTO messages (ts, guild_id, channel_id, user_id, role, content) VALUES (?, ?, ?, ?, ?, ?)",
@@ -81,7 +88,7 @@ def log_message(channel_id: int, user_id: int, role: str, content: str, guild_id
 
 
 def get_recent_context(channel_id: int, user_id: int, limit: int = 12):  # conv. context from channel and user
-    con = sqlite3.connect(DB_PATH)
+    con = _db_connect()
     cur = con.cursor()
     cur.execute(
         """
@@ -98,8 +105,8 @@ def get_recent_context(channel_id: int, user_id: int, limit: int = 12):  # conv.
     rows.reverse()  # (oldest => newest) instead of (newest => oldest) for chronological order
     return [{"role": r, "content": c} for (r, c) in rows]
 
-
-def _build_transcript(context_messages: list[dict]) -> str: # DB msg to chat formate
+# helper function for building transcript from msgs
+def _build_transcript(context_messages: list[dict]) -> str:
     lines: list[str] = []
     for m in context_messages:
         role = m.get("role", "").strip().lower()
@@ -115,11 +122,12 @@ def _build_transcript(context_messages: list[dict]) -> str: # DB msg to chat for
         lines.append(f"{prefix}: {content}")
 
     lines.append("Assistant:")
+
     return "\n".join(lines)
 
 
 def get_user_model(user_id: str) -> str | None:
-    con = sqlite3.connect(DB_PATH)
+    con = _db_connect()
     cur = con.cursor()
     cur.execute("SELECT model_id FROM user_model_selection WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -128,7 +136,7 @@ def get_user_model(user_id: str) -> str | None:
 
 
 def set_user_model(user_id: str, model_id: str):
-    con = sqlite3.connect(DB_PATH)
+    con = _db_connect()
     cur = con.cursor()
     cur.execute(
         """
@@ -162,11 +170,12 @@ PROVIDER_ENV = {
     "openai": "OPENAI_API_KEY",
     "gemini": "LLM_GEMINI_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "ollama": None,
 }
 
 
 def save_provider_key(user_id: str, provider: str, api_key: str):
-    con = sqlite3.connect(DB_PATH)
+    con = _db_connect()
     cur = con.cursor()
     cur.execute(
         """
@@ -181,7 +190,7 @@ def save_provider_key(user_id: str, provider: str, api_key: str):
 
 
 def get_provider_key(user_id: str, provider: str) -> str | None:
-    con = sqlite3.connect(DB_PATH)
+    con = _db_connect()
     cur = con.cursor()
     cur.execute(
         "SELECT api_key FROM user_provider_keys WHERE user_id = ? AND provider = ?",
@@ -200,7 +209,6 @@ def _provider_from_model_id(model_id: str) -> str | None:
         return "anthropic"
     if "gemini" in mid:
         return "gemini"
-    # Default: treat as openai (works for gpt-* / o* names when using llm's openai integration)
     return "openai"
 
 
@@ -217,7 +225,7 @@ def _run_llm_for_user_sync(user_id: str, model_id: str, context_messages: list[d
     # Pull the per-user key if provider needs it
     user_key = None
     if env_key:
-        user_key = get_provider_key(user_id, provider)  # type: ignore[arg-type]
+        user_key = get_provider_key(user_id, provider)
         if not user_key:
             raise RuntimeError(f"No API key set for {provider}. Use /setkey {provider} <key>.")
 
@@ -227,12 +235,8 @@ def _run_llm_for_user_sync(user_id: str, model_id: str, context_messages: list[d
         try:
             if env_key and user_key:
                 os.environ[env_key] = user_key
-                print(f"[LLM] injected {env_key} startswith:", os.environ[env_key][:8])
 
             model = llm.get_model(model_id)
-            print("[LLM] model_id:", model_id)
-            print("[LLM] python type:", type(model))
-            print("[LLM] repr:", repr(model))
 
             resp = model.prompt(transcript, system=system_prompt)
             return resp.text().strip()
@@ -253,8 +257,7 @@ async def llm_reply(model_id: str, context_messages: list[dict],
 
     print("========== MODEL DEBUG ==========")
     print("User ID:", user_id)
-    print("DB model:", get_user_model(user_id))
-    print("[LLM] env OPENAI_API_KEY startswith:", (os.environ.get("OPENAI_API_KEY") or "")[:8])
+    print("DB model:", get_user_model(user_id) if user_id else None)
     print("Passed model_id:", model_id)
     print("Fallback MODEL constant:", MODEL)
     print("=================================")
@@ -344,7 +347,11 @@ async def chat(ctx: commands.Context, *, text: str):
     async with ctx.typing():
         context = get_recent_context(ctx.channel.id, ctx.author.id, limit=12)
         selected_model = get_user_model(str(ctx.author.id)) or MODEL
-        answer = await llm_reply(selected_model, context, user_id=str(ctx.author.id))
+        try:
+            answer = await llm_reply(selected_model, context, user_id=str(ctx.author.id))
+        except Exception as e:
+            print("[LLM ERROR]", type(e).__name__, str(e))
+            answer = "Error generating response"
 
     # save assistant message
     log_message(ctx.channel.id, ctx.author.id, "assistant", answer, ctx.guild.id if ctx.guild else None)
@@ -356,7 +363,7 @@ async def chat(ctx: commands.Context, *, text: str):
 
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN or not OPENAI_API_KEY:  # Token error
-        raise RuntimeError("Missing DISCORD_TOKEN or OPENAI_API_KEY in environment/.env")
+    if not DISCORD_TOKEN:  # Token error
+        raise RuntimeError("Missing DISCORD_TOKEN")
     init_db()
     bot.run(DISCORD_TOKEN)
