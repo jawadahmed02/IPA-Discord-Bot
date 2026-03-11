@@ -12,10 +12,13 @@ from discord import app_commands
 
 from dotenv import load_dotenv
 
+from cryptography.fernet import Fernet, InvalidToken
+
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_MASTER_KEY = os.getenv("BOT_MASTER_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
 intents = discord.Intents.default()  # default discord events enabled
@@ -26,25 +29,85 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 DB_PATH = "bot.db"  # database path
 
 
-# table parameters below are as listed:
-# unique id
-# timestamp
-# conv server
-# conv channel
-# conv user
-# conv role
-# msg content
+# new encryption features
+# Fernet - AES encryption + HMAC authentication
+def _get_fernet() -> Fernet:
+    if not BOT_MASTER_KEY:
+        raise RuntimeError("Missing BOT_MASTER_KEY in environment")
+    try:
+        return Fernet(BOT_MASTER_KEY.strip().encode())
+    except Exception as e:
+        raise RuntimeError("BOT_MASTER_KEY is invalid") from e
+
+
+def encrypt_api_key(api_key: str) -> bytes:
+    return _get_fernet().encrypt(api_key.encode("utf-8"))
+
+
+def decrypt_api_key(token: bytes) -> str:
+    try:
+        return _get_fernet().decrypt(token).decode("utf-8")
+    except InvalidToken as e:
+        raise RuntimeError("Failed to decrypt API key: invalid master key or corrupted data") from e
+
+def migrate_plaintext_keys_if_needed():
+    con = _db_connect()
+    try:
+        cur = con.cursor()
+
+        cur.execute("PRAGMA table_info(user_provider_keys)")
+        columns = cur.fetchall()
+        column_names = {col[1] for col in columns}
+
+        if "api_key" in column_names:
+            print("[DB] Migrating plaintext API keys to encrypted storage...")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_provider_keys_new (
+                    user_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    api_key_encrypted BLOB NOT NULL,
+                    PRIMARY KEY (user_id, provider)
+                )
+            """)
+
+            cur.execute("SELECT user_id, provider, api_key FROM user_provider_keys")
+            rows = cur.fetchall()
+
+            for user_id, provider, plaintext_key in rows:
+                if plaintext_key is None:
+                    continue
+                plaintext_key = str(plaintext_key).strip()
+                if not plaintext_key:
+                    continue
+
+                encrypted = encrypt_api_key(plaintext_key)
+                cur.execute("""
+                    INSERT OR REPLACE INTO user_provider_keys_new (user_id, provider, api_key_encrypted)
+                    VALUES (?, ?, ?)
+                """, (user_id, provider, encrypted))
+
+            cur.execute("DROP TABLE user_provider_keys")
+            cur.execute("ALTER TABLE user_provider_keys_new RENAME TO user_provider_keys")
+
+            con.commit()
+            print("[DB] Migration complete.")
+        else:
+            con.commit()
+    finally:
+        con.close()
+
 
 def _db_connect():
     con = sqlite3.connect(DB_PATH, timeout=10)
-    con.execute("PRAGMA journal_mode=WAL;") # Readers and writers can’t operate simultaneously
+    con.execute("PRAGMA journal_mode=WAL;") # Improvement for better reader and writer concurrency
     con.execute("PRAGMA synchronous=NORMAL;") # Controls how aggressively SQLite syncs to disk
     con.execute("PRAGMA foreign_keys=ON;")
     return con
 
 def init_db():
-    con = _db_connect()  # open / create database
-    cur = con.cursor()              # cursor for executing SQL
+    con = _db_connect()
+    cur = con.cursor()
 
     cur.executescript("""
         CREATE TABLE IF NOT EXISTS messages (
@@ -56,14 +119,14 @@ def init_db():
             role TEXT NOT NULL,
             content TEXT NOT NULL
         );
-    
+
         CREATE TABLE IF NOT EXISTS user_provider_keys (
             user_id TEXT NOT NULL,
             provider TEXT NOT NULL,
-            api_key TEXT NOT NULL,
+            api_key_encrypted BLOB NOT NULL,
             PRIMARY KEY (user_id, provider)
         );
-    
+
         CREATE TABLE IF NOT EXISTS user_model_selection (
             user_id TEXT NOT NULL PRIMARY KEY,
             model_id TEXT NOT NULL
@@ -72,6 +135,9 @@ def init_db():
 
     con.commit()
     con.close()
+
+    # Run after base init so older DBs get upgraded
+    migrate_plaintext_keys_if_needed()
 
 
 
@@ -175,15 +241,17 @@ PROVIDER_ENV = {
 
 
 def save_provider_key(user_id: str, provider: str, api_key: str):
+    encrypted_key = encrypt_api_key(api_key.strip())
+
     con = _db_connect()
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO user_provider_keys (user_id, provider, api_key)
-        VALUES (?, ?, ?) ON CONFLICT(user_id, provider) DO
-        UPDATE SET api_key=excluded.api_key
+        INSERT INTO user_provider_keys (user_id, provider, api_key_encrypted)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, provider) DO UPDATE SET api_key_encrypted=excluded.api_key_encrypted
         """,
-        (user_id, provider, api_key),
+        (user_id, provider, encrypted_key),
     )
     con.commit()
     con.close()
@@ -193,12 +261,17 @@ def get_provider_key(user_id: str, provider: str) -> str | None:
     con = _db_connect()
     cur = con.cursor()
     cur.execute(
-        "SELECT api_key FROM user_provider_keys WHERE user_id = ? AND provider = ?",
+        "SELECT api_key_encrypted FROM user_provider_keys WHERE user_id = ? AND provider = ?",
         (user_id, provider),
     )
     row = cur.fetchone()
     con.close()
-    return row[0] if row else None
+
+    if not row:
+        return None
+
+    encrypted_key = row[0]
+    return decrypt_api_key(encrypted_key)
 
 
 def _provider_from_model_id(model_id: str) -> str | None:
@@ -350,7 +423,7 @@ async def chat(ctx: commands.Context, *, text: str):
         try:
             answer = await llm_reply(selected_model, context, user_id=str(ctx.author.id))
         except Exception as e:
-            print("[LLM ERROR]", type(e).__name__, str(e))
+            print("[LLM ERROR]", type(e).__name__)
             answer = "Error generating response"
 
     # save assistant message
@@ -363,7 +436,10 @@ async def chat(ctx: commands.Context, *, text: str):
 
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:  # Token error
+    if not DISCORD_TOKEN:
         raise RuntimeError("Missing DISCORD_TOKEN")
+    if not BOT_MASTER_KEY:
+        raise RuntimeError("Missing BOT_MASTER_KEY")
+
     init_db()
     bot.run(DISCORD_TOKEN)
