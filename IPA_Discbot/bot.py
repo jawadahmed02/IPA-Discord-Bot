@@ -3,6 +3,7 @@ import sqlite3
 import llm
 import asyncio
 import threading
+import json
 
 from datetime import datetime, UTC
 
@@ -13,6 +14,8 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from cryptography.fernet import Fernet, InvalidToken
+
+from mcp_client import solve_pddl
 
 load_dotenv()
 
@@ -398,6 +401,72 @@ async def setkey_cmd(interaction: discord.Interaction, provider: str, api_key: s
     )
 
 
+# Keeps replies under Discord's message size limit
+def _truncate_discord_message(text: str, limit: int = 1900) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+# Pretty-prints JSON planner output while still handling plain-text errors cleanly
+def _pretty_json_or_text(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text.strip()
+
+    return json.dumps(parsed, indent=2)
+
+
+# Reads an uploaded file as UTF-8 so PDDL attachments can be sent to the planner
+async def _read_text_attachment(attachment: discord.Attachment) -> str:
+    data = await attachment.read()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"{attachment.filename} is not valid UTF-8 text.") from e
+
+
+# Pulls out the domain/problem pair expected by the default PaaS solve tool
+async def _extract_pddl_attachments(message: discord.Message) -> tuple[str, str]:
+    attachments = list(message.attachments)
+    if len(attachments) < 2:
+        raise RuntimeError("Attach both a domain PDDL file and a problem PDDL file.")
+
+    domain_text: str | None = None
+    problem_text: str | None = None
+
+    for attachment in attachments:
+        filename = attachment.filename.lower()
+        content = await _read_text_attachment(attachment)
+
+        if domain_text is None and "domain" in filename:
+            domain_text = content
+            continue
+
+        if problem_text is None and "problem" in filename:
+            problem_text = content
+
+    if domain_text is None or problem_text is None:
+        pddl_files = [
+            attachment for attachment in attachments
+            if attachment.filename.lower().endswith((".pddl", ".txt"))
+        ]
+        if len(pddl_files) >= 2:
+            if domain_text is None:
+                domain_text = await _read_text_attachment(pddl_files[0])
+            if problem_text is None:
+                problem_text = await _read_text_attachment(pddl_files[1])
+
+    if domain_text is None or problem_text is None:
+        raise RuntimeError(
+            "Could not identify both files. Name them with `domain` and `problem`, "
+            "or attach exactly two PDDL text files."
+        )
+
+    return domain_text, problem_text
+
+
 # -------------------------------------- Model change features end  here -----------------------------------------------
 
 GUILD_ID = 1376609949114699886 # uBots server id
@@ -430,9 +499,22 @@ async def chat(ctx: commands.Context, *, text: str):
     log_message(ctx.channel.id, ctx.author.id, "assistant", answer, ctx.guild.id if ctx.guild else None)
 
     # discord message limit safeguard
-    if len(answer) > 1900:
-        answer = answer[:1900] + "…"
-    await ctx.reply(answer)
+    await ctx.reply(_truncate_discord_message(answer))
+
+
+# Minimal planning entrypoint: read attached PDDL files and run the default PaaS solver
+@bot.command()
+async def solve(ctx: commands.Context):
+    async with ctx.typing():
+        try:
+            domain_text, problem_text = await _extract_pddl_attachments(ctx.message)
+            result = await solve_pddl(domain_text, problem_text)
+        except Exception as e:
+            await ctx.reply(_truncate_discord_message(f"Solve failed: {e}"))
+            return
+
+    formatted = _pretty_json_or_text(result)
+    await ctx.reply(_truncate_discord_message(f"```json\n{formatted}\n```"))
 
 
 if __name__ == "__main__":
