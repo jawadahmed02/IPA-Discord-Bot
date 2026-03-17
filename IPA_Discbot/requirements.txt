@@ -1,3 +1,5 @@
 discord.py
 python-dotenv
-openai
+cryptography
+llm
+mcp==1.25.0
