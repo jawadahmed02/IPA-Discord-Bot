@@ -408,16 +408,6 @@ def _truncate_discord_message(text: str, limit: int = 1900) -> str:
     return text[:limit] + "..."
 
 
-# Pretty-prints JSON planner output while still handling plain-text errors cleanly
-def _pretty_json_or_text(text: str) -> str:
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return text.strip()
-
-    return json.dumps(parsed, indent=2)
-
-
 # Reads an uploaded file as UTF-8 so PDDL attachments can be sent to the planner
 async def _read_text_attachment(attachment: discord.Attachment) -> str:
     data = await attachment.read()
@@ -480,8 +470,7 @@ async def on_ready():
     print(f"Synced {len(synced)} commands to guild {GUILD_ID}.")
 
 
-
-@bot.command()  # Primary conversation comman
+@bot.command()  # Primary conversation command
 async def chat(ctx: commands.Context, *, text: str):
     # save user message
     log_message(ctx.channel.id, ctx.author.id, "user", text, ctx.guild.id if ctx.guild else None)
@@ -502,7 +491,8 @@ async def chat(ctx: commands.Context, *, text: str):
     await ctx.reply(_truncate_discord_message(answer))
 
 
-# Minimal planning entrypoint: read attached PDDL files and run the default PaaS solver
+import traceback
+
 @bot.command()
 async def solve(ctx: commands.Context):
     async with ctx.typing():
@@ -510,11 +500,11 @@ async def solve(ctx: commands.Context):
             domain_text, problem_text = await _extract_pddl_attachments(ctx.message)
             result = await solve_pddl(domain_text, problem_text)
         except Exception as e:
-            await ctx.reply(_truncate_discord_message(f"Solve failed: {e}"))
+            traceback.print_exc()
+            await ctx.reply(_truncate_discord_message(f"Solve failed: {type(e).__name__}: {e}"))
             return
 
-    formatted = _pretty_json_or_text(result)
-    await ctx.reply(_truncate_discord_message(f"```json\n{formatted}\n```"))
+    await ctx.reply(_truncate_discord_message(f"```text\n{result.strip()}\n```"))
 
 
 if __name__ == "__main__":
