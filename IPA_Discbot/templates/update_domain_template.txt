@@ -1,0 +1,98 @@
+# Domain Update Template
+
+Use this template to update planning domains. Include only the sections you need to change. For each section, use the exact heading format and fenced code block structure shown below.
+
+## Instructions for LLM:
+- Include only sections that need updates
+- For empty sections, keep the heading but leave the fenced block empty
+- Use descriptive names and comments
+- Follow the exact format for each section type
+- Action names should precede their parameter/precondition/effect blocks
+- Use `## NEXT ACTION` to separate multiple actions
+
+### TYPES
+```python
+{
+    "robot": "mobile agent that can move and carry packages",
+    "location": "places where robots and packages can be",
+    "package": "items that need to be delivered"
+}
+```
+
+### CONSTANTS
+```python
+{
+    "depot": "location",
+    "warehouse": "location"
+}
+```
+
+### New Predicates
+```text
+- (at ?r - robot ?l - location): robot r is at location l
+- (carrying ?r - robot ?p - package): robot r is carrying package p
+- (delivered ?p - package ?l - location): package p has been delivered to location l
+- (connected ?l1 - location ?l2 - location): locations l1 and l2 are connected
+```
+
+### FUNCTIONS
+```text
+- (battery-level ?r - robot) - number: current battery level of robot r
+- (distance ?l1 - location ?l2 - location) - number: distance between locations
+```
+
+### Action Parameters
+```text
+- ?r - robot: the robot performing the action
+- ?from - location: starting location
+- ?to - location: destination location
+```
+
+### Action Preconditions
+```lisp
+(and
+  (at ?r ?from) ; robot must be at starting location
+  (connected ?from ?to) ; locations must be connected
+)
+```
+
+### New Predicates
+```text
+- (visited ?r - robot ?l - location): robot r has visited location l
+```
+
+### Action Effects
+```lisp
+(and
+  (not (at ?r ?from)) ; robot is no longer at start
+  (at ?r ?to) ; robot is now at destination
+  (visited ?r ?to) ; mark location as visited
+)
+```
+
+## NEXT ACTION
+
+### Action Parameters
+```text
+- ?r - robot: the robot performing the pickup
+- ?p - package: the package to pick up
+- ?l - location: location where pickup occurs
+```
+
+### Action Preconditions
+```lisp
+(and
+  (at ?r ?l) ; robot must be at the location
+  (at ?p ?l) ; package must be at the location
+  (not (carrying ?r ?any_package)) ; robot must not be carrying anything
+)
+```
+
+### Action Effects
+```lisp
+(and
+  (not (at ?p ?l)) ; package is no longer at location
+  (carrying ?r ?p) ; robot is now carrying the package
+)
+```</content>
+<parameter name="filePath">c:\Users\jawad\OneDrive\Desktop\discord_bot\IPA-Discord-Bot\IPA_Discbot\templates\update_domain_template.txt
