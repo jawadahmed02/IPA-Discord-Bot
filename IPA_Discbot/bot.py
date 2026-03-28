@@ -19,7 +19,10 @@ from dotenv import load_dotenv
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from mcp_client import solve_pddl
+try:
+    from .mcp_client import solve_pddl
+except ImportError:
+    from mcp_client import solve_pddl
 
 load_dotenv()
 

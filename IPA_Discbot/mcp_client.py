@@ -1,47 +1,17 @@
 import json
 import os
-import shlex
 from typing import Any
 
 from mcp.client.session import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
 
-# Allows the bot to pass optional environment overrides into the spawned MCP server
-def _env_json(name: str) -> dict[str, str] | None:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return None
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{name} must be valid JSON") from exc
-
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"{name} must decode to an object")
-
-    return {str(k): str(v) for k, v in parsed.items()}
+DEFAULT_PAAS_MCP_URL = "https://solver.planning.domains/mcp"
 
 
-# Centralizes how we launch the local PaaS MCP wrapper over stdio
-def paas_stdio_server() -> StdioServerParameters:
-    command = os.getenv("PAAS_MCP_COMMAND", "python3").strip() or "python3"
-    args_raw = os.getenv("PAAS_MCP_ARGS", "").strip()
-    args = shlex.split(args_raw, posix=False) if args_raw else []
-
-    if not args:
-        raise RuntimeError(
-            "Missing PAAS_MCP_ARGS. Configure the planning-as-a-service MCP wrapper in your .env, "
-            "for example on Windows:\n"
-            'PAAS_MCP_COMMAND=py\n'
-            'PAAS_MCP_ARGS="-3 C:/path/to/planning-as-a-service/server/mcp/mcp_wrap.py"\n'
-            'PAAS_MCP_ENV_JSON={"PAAS_HOST":"localhost","PAAS_PORT":"5001"}'
-        )
-
-    env = _env_json("PAAS_MCP_ENV_JSON")
-    return StdioServerParameters(command=command, args=args, env=env)
-
+# Retrieves the PaaS MCP URL from environment variables, with a default fallback
+def paas_mcp_url() -> str:
+    return os.getenv("PAAS_MCP_URL", DEFAULT_PAAS_MCP_URL).strip() or DEFAULT_PAAS_MCP_URL
 
 # Normalizes MCP tool results into plain text that Discord can display
 def _tool_text(result: Any) -> str:
@@ -84,9 +54,7 @@ def _extract_plan_text(text: str) -> str:
 
 # Opens an MCP session, calls one named PaaS tool, and returns its text output
 async def _call_paas_tool(tool_name: str, arguments: dict[str, Any]) -> str:
-    server = paas_stdio_server()
-
-    async with stdio_client(server) as (read, write):
+    async with streamable_http_client(paas_mcp_url()) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments)
@@ -100,3 +68,18 @@ async def solve_pddl(domain: str, problem: str, timeout_s: int = 30) -> str:
         {"domain": domain, "problem": problem, "timeout_s": timeout_s},
     )
     return _extract_plan_text(result)
+
+
+# Small connectivity check that initializes the session and confirms the solve tool exists.
+async def verify_remote_mcp_server(expected_tool: str = "paas_lama_first_solve") -> str:
+    async with streamable_http_client(paas_mcp_url()) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            tool_names = [tool.name for tool in getattr(tools, "tools", [])]
+            if expected_tool not in tool_names:
+                available = ", ".join(tool_names) or "none"
+                raise RuntimeError(
+                    f"Connected to MCP server, but `{expected_tool}` was not advertised. Available tools: {available}"
+                )
+            return f"Connected to {paas_mcp_url()} and found `{expected_tool}`."
