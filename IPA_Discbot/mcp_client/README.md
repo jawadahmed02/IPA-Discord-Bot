@@ -37,6 +37,8 @@ The main helpers exposed to the rest of the repo are:
 - `close_mcp_servers()`
 - `solve_pddl()`
 - `list_all_mcp_tools()`
+- `refresh_mcp_tool_catalog()`
+- `get_mcp_tool_catalog()`
 - `update_domain_via_l2p()`
 - `update_task_via_l2p()`
 - `verify_mcp_server()`

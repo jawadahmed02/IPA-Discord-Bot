@@ -29,9 +29,28 @@ This package contains the Discord bot itself. It is responsible for loading runt
 - Logs user and assistant messages into SQLite for cross-session context
 - Lets users choose models with `/models` and `/use`
 - Stores per-user provider keys with `/setkey`
-- Accepts solve requests through `!solve` or natural-language attachment messages
+- Accepts solve requests through `!solve` with either PDDL attachments or a natural-language request
 - Supports `!tools` to list available MCP tools from both backends
-- Supports private chat-thread creation with `!chat`
+- Supports private chat-thread creation with `!thread`
+- Supports per-channel chat toggling with `!chat`
+- Supports provider-key sharing with `!share` and session persistence with `!save`
+
+## Running The Bot
+
+From the repo root, run:
+
+```bash
+python3 -m IPA_Discbot.bot
+```
+
+Before starting the bot, make sure your environment is set up with:
+
+- `DISCORD_TOKEN`
+- `BOT_MASTER_KEY`
+- `PAAS_MCP_URL`
+- `L2P_MCP_URL`
+
+If you want to use a provider-backed model for conversation or natural-language solve, also set the corresponding provider key such as `OPENAI_API_KEY`, `LLM_GEMINI_KEY`, or `ANTHROPIC_API_KEY`.
 
 ## Dependencies On Other Packages
 
