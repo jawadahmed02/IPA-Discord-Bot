@@ -10,6 +10,11 @@ from .parsing import (
     require_dict_payload,
 )
 
+_MCP_TOOL_CATALOG: dict[MCPServerName, list[dict[str, Any]]] = {
+    "paas": [],
+    "l2p": [],
+}
+
 
 async def solve_pddl(domain: str, problem: str, timeout_s: int = 30) -> str:
     result = await call_mcp_tool(
@@ -110,3 +115,24 @@ async def list_all_mcp_tools() -> dict[MCPServerName, list[dict[str, str]]]:
         "paas": await list_mcp_tools("paas"),
         "l2p": await list_mcp_tools("l2p"),
     }
+
+
+async def refresh_mcp_tool_catalog() -> dict[MCPServerName, list[dict[str, Any]]]:
+    global _MCP_TOOL_CATALOG
+    _MCP_TOOL_CATALOG = {
+        "paas": [dict(tool) for tool in await list_mcp_tools("paas")],
+        "l2p": [dict(tool) for tool in await list_mcp_tools("l2p")],
+    }
+    return {
+        server: [dict(tool) for tool in tools]
+        for server, tools in _MCP_TOOL_CATALOG.items()
+    }
+
+
+async def get_mcp_tool_catalog() -> dict[MCPServerName, list[dict[str, Any]]]:
+    if any(_MCP_TOOL_CATALOG[server] for server in _MCP_TOOL_CATALOG):
+        return {
+            server: [dict(tool) for tool in tools]
+            for server, tools in _MCP_TOOL_CATALOG.items()
+        }
+    return await refresh_mcp_tool_catalog()

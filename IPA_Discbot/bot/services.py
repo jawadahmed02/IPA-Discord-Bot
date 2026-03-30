@@ -13,20 +13,31 @@ from ..mcp_client import (
     connect_mcp_servers,
     list_all_mcp_tools,
     solve_pddl,
+    update_domain_via_l2p,
+    update_task_via_l2p,
 )
 from .llm_helpers import (
     _all_llm_model_ids,
+    _format_solve_reply,
     _llm_classify_confirmation_reply,
     _llm_classify_member_request,
+    _llm_plan_from_natural_language,
+    _parse_solve_response_text,
     llm_reply,
 )
 from .config import GUILD_ID, MODEL, PENDING_MEMBER_CONFIRMATIONS, bot
 from .storage import (
+    get_share_mode,
     get_recent_context,
     get_user_model,
+    is_chat_enabled,
     log_message,
+    save_current_session,
     save_provider_key,
+    set_chat_enabled,
+    set_share_mode,
     set_user_model,
+    user_has_any_provider_key,
 )
 
 
@@ -84,6 +95,35 @@ def _format_mcp_tools_message(tool_map: dict[str, list[dict[str, str]]]) -> str:
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+def _pddl_from_l2p_payload(payload: dict[str, object], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _solve_output_has_action_steps(text: str) -> bool:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("(") and line.endswith(")"):
+            return True
+    return False
+
+
+def _planner_output_indicates_failure(text: str) -> bool:
+    lowered = text.lower()
+    failure_markers = (
+        "driver aborting",
+        "translate exit code",
+        "search exit code",
+        "planner failed",
+        "unsolvable",
+        "error:",
+    )
+    return any(marker in lowered for marker in failure_markers)
 
 
 async def _read_text_attachment(attachment: discord.Attachment) -> str:
@@ -411,8 +451,9 @@ async def _handle_solve_request(message: discord.Message) -> bool:
             )
             return True
 
+    result = _parse_solve_response_text(result)
     await message.reply(
-        _truncate_discord_message(f"```text\n{result.strip()}\n```"),
+        _truncate_discord_message(_format_solve_reply(result)),
         mention_author=False,
     )
     return True
@@ -535,8 +576,9 @@ async def _handle_conversation_message(message: discord.Message):
                 selected_model, context, user_id=str(message.author.id)
             )
         except Exception as e:
-            print("[LLM ERROR]", type(e).__name__)
-            answer = "Error generating response"
+            print("[LLM ERROR]", type(e).__name__, e)
+            traceback.print_exc()
+            answer = f"Error generating response: {type(e).__name__}: {e}"
 
     log_message(
         message.channel.id,
@@ -559,11 +601,14 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    if not is_chat_enabled(str(message.author.id), str(message.channel.id)):
+        return
+
     await _handle_conversation_message(message)
 
 
 @bot.command()
-async def chat(ctx: commands.Context, *, topic: str | None = None):
+async def thread(ctx: commands.Context, *, topic: str | None = None):
     if ctx.guild is None:
         await ctx.reply("Thread creation only works in a server channel.")
         return
@@ -599,11 +644,95 @@ async def chat(ctx: commands.Context, *, topic: str | None = None):
 
 
 @bot.command()
-async def solve(ctx: commands.Context):
+async def chat(ctx: commands.Context):
+    user_id = str(ctx.author.id)
+    channel_id = str(ctx.channel.id)
+    enabled = not is_chat_enabled(user_id, channel_id)
+    set_chat_enabled(user_id, channel_id, enabled)
+
+    if enabled:
+        await ctx.reply("LLM chat is now `on` in this channel for you.")
+        return
+
+    await ctx.reply(
+        "LLM chat is now `off` in this channel for you. Your normal messages here will no longer call the bot until you run `!chat` again."
+    )
+
+
+@bot.command()
+async def solve(ctx: commands.Context, *, request: str | None = None):
     async with ctx.typing():
         try:
-            domain_text, problem_text = await _extract_pddl_attachments(ctx.message)
-            result = await solve_pddl(domain_text, problem_text)
+            if ctx.message.attachments:
+                domain_text, problem_text = await _extract_pddl_attachments(ctx.message)
+                result = await solve_pddl(domain_text, problem_text)
+            else:
+                request_text = (request or "").strip()
+                if not request_text:
+                    await ctx.reply(
+                        "Use `!solve` with a domain and problem attachment pair, or `!solve <natural language request>`."
+                    )
+                    return
+
+                result = ""
+                retry_feedback: str | None = None
+
+                for _ in range(2):
+                    llm_plan = await _llm_plan_from_natural_language(
+                        ctx.message, request_text, retry_feedback
+                    )
+                    domain_name = str(llm_plan.get("domain_name", "")).strip()
+                    problem_name = str(llm_plan.get("problem_name", "")).strip()
+                    domain_update = str(llm_plan.get("domain_update", "")).strip()
+                    task_update = str(llm_plan.get("task_update", "")).strip()
+                    action_name = llm_plan.get("action_name")
+
+                    if not domain_name or not problem_name or not domain_update or not task_update:
+                        raise RuntimeError("The model did not return a complete domain/task update payload.")
+
+                    try:
+                        domain_payload = await update_domain_via_l2p(
+                            domain_update=domain_update,
+                            domain_name=domain_name,
+                            action_name=action_name,
+                        )
+                        task_payload = await update_task_via_l2p(
+                            task_update=task_update,
+                            domain_name=domain_name,
+                            problem_name=problem_name,
+                        )
+                    except RuntimeError as e:
+                        retry_feedback = str(e)
+                        continue
+
+                    domain_text = _pddl_from_l2p_payload(
+                        domain_payload,
+                        "domain_pddl",
+                        "domain",
+                        "pddl",
+                    )
+                    problem_text = _pddl_from_l2p_payload(
+                        task_payload,
+                        "task_pddl",
+                        "problem_pddl",
+                        "problem",
+                        "task",
+                        "pddl",
+                    )
+
+                    if not domain_text or not problem_text:
+                        raise RuntimeError("Failed to generate PDDL from the natural-language request.")
+
+                    raw_result = await solve_pddl(domain_text, problem_text)
+                    result = _parse_solve_response_text(raw_result)
+                    if _planner_output_indicates_failure(result) and not _solve_output_has_action_steps(
+                        result
+                    ):
+                        retry_feedback = result
+                        continue
+                    break
+                else:
+                    raise RuntimeError(retry_feedback or "Failed to produce a valid plan.")
         except Exception as e:
             traceback.print_exc()
             await ctx.reply(
@@ -611,7 +740,9 @@ async def solve(ctx: commands.Context):
             )
             return
 
-    await ctx.reply(_truncate_discord_message(f"```text\n{result.strip()}\n```"))
+    if ctx.message.attachments:
+        result = _parse_solve_response_text(result)
+    await ctx.reply(_truncate_discord_message(_format_solve_reply(result)))
 
 
 @bot.command()
@@ -632,3 +763,36 @@ async def tools(ctx: commands.Context):
     await ctx.reply(messages[0])
     for chunk in messages[1:]:
         await ctx.send(chunk)
+
+
+@bot.command()
+async def share(ctx: commands.Context):
+    user_id = str(ctx.author.id)
+
+    if not user_has_any_provider_key(user_id):
+        await ctx.reply("Set an API key first with `/setkey`, then you can toggle sharing.")
+        return
+
+    current_mode = get_share_mode(user_id)
+    new_mode = "group" if current_mode == "individual" else "individual"
+    set_share_mode(user_id, new_mode)
+
+    if new_mode == "group":
+        await ctx.reply(
+            "Share mode is now `group`. Other users can use the bot through your saved API key when they do not have their own key for that provider."
+        )
+        return
+
+    await ctx.reply(
+        "Share mode is now `individual`. Only you can use your saved API key."
+    )
+
+
+@bot.command()
+async def save(ctx: commands.Context):
+    is_new_save = save_current_session()
+    if is_new_save:
+        await ctx.reply("Saved the current bot session. Its conversation log will be kept after restart.")
+        return
+
+    await ctx.reply("This bot session was already saved.")

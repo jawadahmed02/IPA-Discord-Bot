@@ -141,6 +141,23 @@ def init_db():
             user_id TEXT NOT NULL PRIMARY KEY,
             model_id TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS user_share_mode (
+            user_id TEXT NOT NULL PRIMARY KEY,
+            share_mode TEXT NOT NULL CHECK (share_mode IN ('individual', 'group'))
+        );
+
+        CREATE TABLE IF NOT EXISTS user_channel_chat_mode (
+            user_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            chat_enabled INTEGER NOT NULL CHECK (chat_enabled IN (0, 1)),
+            PRIMARY KEY (user_id, channel_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS saved_sessions (
+            session_id TEXT PRIMARY KEY,
+            saved_at TEXT NOT NULL
+        );
     """
     )
 
@@ -149,6 +166,7 @@ def init_db():
 
     migrate_plaintext_keys_if_needed()
     migrate_messages_session_column_if_needed()
+    cleanup_unsaved_sessions()
     print(f"[DB] Bot session started: {BOT_SESSION_ID}")
 
 
@@ -178,6 +196,58 @@ def log_message(
     )
     con.commit()
     con.close()
+
+
+def cleanup_unsaved_sessions():
+    con = _db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            DELETE FROM messages
+            WHERE session_id IS NOT NULL
+              AND TRIM(session_id) != ''
+              AND session_id != 'legacy'
+              AND session_id NOT IN (SELECT session_id FROM saved_sessions)
+            """
+        )
+        deleted_rows = cur.rowcount if cur.rowcount is not None else 0
+
+        cur.execute(
+            """
+            DELETE FROM saved_sessions
+            WHERE session_id NOT IN (SELECT DISTINCT session_id FROM messages)
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    if deleted_rows:
+        print(f"[DB] Deleted {deleted_rows} unsaved message(s) from prior bot sessions.")
+
+
+def save_current_session() -> bool:
+    con = _db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT 1 FROM saved_sessions WHERE session_id = ?",
+            (BOT_SESSION_ID,),
+        )
+        already_saved = cur.fetchone() is not None
+        if not already_saved:
+            cur.execute(
+                """
+                INSERT INTO saved_sessions (session_id, saved_at)
+                VALUES (?, ?)
+                """,
+                (BOT_SESSION_ID, datetime.now(UTC).isoformat()),
+            )
+            con.commit()
+        return not already_saved
+    finally:
+        con.close()
 
 
 def get_recent_context(
@@ -277,6 +347,18 @@ def save_provider_key(user_id: str, provider: str, api_key: str):
     con.close()
 
 
+def user_has_any_provider_key(user_id: str) -> bool:
+    con = _db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT 1 FROM user_provider_keys WHERE user_id = ? LIMIT 1",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    return row is not None
+
+
 def get_provider_key(user_id: str, provider: str) -> str | None:
     con = _db_connect()
     cur = con.cursor()
@@ -292,3 +374,87 @@ def get_provider_key(user_id: str, provider: str) -> str | None:
 
     encrypted_key = row[0]
     return decrypt_api_key(encrypted_key)
+
+
+def get_share_mode(user_id: str) -> str:
+    con = _db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT share_mode FROM user_share_mode WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    return row[0] if row else "individual"
+
+
+def set_share_mode(user_id: str, share_mode: str):
+    con = _db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO user_share_mode (user_id, share_mode)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET share_mode=excluded.share_mode
+        """,
+        (user_id, share_mode),
+    )
+    con.commit()
+    con.close()
+
+
+def is_chat_enabled(user_id: str, channel_id: str) -> bool:
+    con = _db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT chat_enabled FROM user_channel_chat_mode WHERE user_id = ? AND channel_id = ?",
+        (user_id, channel_id),
+    )
+    row = cur.fetchone()
+    con.close()
+    return bool(row[0]) if row else True
+
+
+def set_chat_enabled(user_id: str, channel_id: str, enabled: bool):
+    con = _db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO user_channel_chat_mode (user_id, channel_id, chat_enabled)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, channel_id) DO UPDATE SET chat_enabled=excluded.chat_enabled
+        """,
+        (user_id, channel_id, int(enabled)),
+    )
+    con.commit()
+    con.close()
+
+
+def get_effective_provider_key(user_id: str, provider: str) -> tuple[str | None, str | None]:
+    own_key = get_provider_key(user_id, provider)
+    if own_key:
+        return own_key, user_id
+
+    con = _db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT upk.user_id, upk.api_key_encrypted
+        FROM user_provider_keys upk
+        JOIN user_share_mode usm ON usm.user_id = upk.user_id
+        WHERE upk.provider = ?
+          AND usm.share_mode = 'group'
+          AND upk.user_id != ?
+        ORDER BY upk.user_id
+        LIMIT 1
+        """,
+        (provider, user_id),
+    )
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        return None, None
+
+    owner_user_id, encrypted_key = row
+    return decrypt_api_key(encrypted_key), owner_user_id

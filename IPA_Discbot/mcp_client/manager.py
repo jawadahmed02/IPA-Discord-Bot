@@ -51,7 +51,7 @@ class LiveMCPServerConnection:
             result = await session.call_tool(tool_name, arguments)
             return tool_payload(result)
 
-    async def list_tools(self) -> list[dict[str, str]]:
+    async def list_tools(self) -> list[dict[str, Any]]:
         async with self._lock:
             session = await self._connect_locked()
             tools = await session.list_tools()
@@ -59,6 +59,10 @@ class LiveMCPServerConnection:
                 {
                     "name": tool.name,
                     "description": (getattr(tool, "description", None) or "").strip(),
+                    "input_schema": getattr(tool, "inputSchema", None)
+                    or getattr(tool, "input_schema", None),
+                    "output_schema": getattr(tool, "outputSchema", None)
+                    or getattr(tool, "output_schema", None),
                 }
                 for tool in getattr(tools, "tools", [])
             ]
@@ -101,7 +105,7 @@ class MCPConnectionManager:
     ) -> Any:
         return await self._servers[server].call_tool(tool_name, arguments)
 
-    async def list_tools(self, server: MCPServerName) -> list[dict[str, str]]:
+    async def list_tools(self, server: MCPServerName) -> list[dict[str, Any]]:
         return await self._servers[server].list_tools()
 
 
@@ -124,5 +128,5 @@ async def call_mcp_tool(
     return await _MCP_CONNECTIONS.call_tool(server, tool_name, arguments)
 
 
-async def list_mcp_tools(server: MCPServerName) -> list[dict[str, str]]:
+async def list_mcp_tools(server: MCPServerName) -> list[dict[str, Any]]:
     return await _MCP_CONNECTIONS.list_tools(server)

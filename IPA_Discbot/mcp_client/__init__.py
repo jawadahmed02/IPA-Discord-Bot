@@ -7,7 +7,9 @@ from .config import (
 )
 from .manager import close_mcp_servers, connect_mcp_servers
 from .services import (
+    get_mcp_tool_catalog,
     list_all_mcp_tools,
+    refresh_mcp_tool_catalog,
     solve_pddl,
     update_domain_via_l2p,
     update_task_via_l2p,
