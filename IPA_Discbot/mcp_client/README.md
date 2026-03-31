@@ -19,6 +19,11 @@ The client currently supports two MCP servers:
 
 Each backend resolves its URL from environment variables first, with a built-in fallback default.
 
+Current defaults:
+
+- `PAAS_MCP_URL`: `https://solver.planning.domains/mcp`
+- `L2P_MCP_URL`: `http://127.0.0.1:8002/mcp`
+
 ## Connection Model
 
 The package keeps one live MCP connection per backend during bot runtime. Those sessions are opened on bot startup and closed on shutdown.
@@ -36,6 +41,10 @@ The main helpers exposed to the rest of the repo are:
 - `connect_mcp_servers()`
 - `close_mcp_servers()`
 - `solve_pddl()`
+- `validate_domain()`
+- `validate_plan()`
+- `validate_task()`
+- `validate_plan_with_val()`
 - `list_all_mcp_tools()`
 - `refresh_mcp_tool_catalog()`
 - `get_mcp_tool_catalog()`

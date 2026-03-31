@@ -2,12 +2,14 @@
 
 `IPA_Discbot` is a Discord-based interactive planning assistant. It combines a conversational bot, persistent user context, model selection through the `llm` Python package, and MCP-backed planning services so users can move between natural-language requests and planning tools inside Discord.
 
-## High-Level Architecture
+## Repository Layout
 
 The repo is organized around two main internal packages:
 
 - `IPA_Discbot/bot/` contains the Discord bot runtime, command handlers, conversation flow, and persistence logic.
 - `IPA_Discbot/mcp_client/` contains the MCP integration layer that talks to the planning backends.
+
+## High-Level Architecture
 
 At runtime, the flow is:
 
@@ -34,11 +36,38 @@ The bot currently supports:
 - normal conversational replies with persisted context
 - per-user model selection
 - per-user provider key storage
-- PDDL solve requests from Discord attachments
-- natural-language `!solve` requests that go through the local `l2p` MCP server before solving
+- planning requests from Discord attachments with `!plan`
+- natural-language `!plan`, `!domain`, and `!problem` flows that go through the local `l2p` MCP server before solving
+- artifact inspection and revision with `!show`, `!edit`, and `!undo`
+- plan, domain, task, and VAL-based validation flows with `!validate`, `!validate_domain`, `!validate_task`, and `!autovalidate`
 - thread creation, member lookup, and thread-add helper flows
 - session saving and provider-key sharing controls
-- MCP tool listing across both configured servers
+- MCP tool listing across both configured servers with `!tools` and `!paastools`
+
+## Setup
+
+Install dependencies from the repo root with:
+
+```bash
+python3 -m pip install -r IPA_Discbot/requirements.txt
+```
+
+Set up a `.env` file with at least:
+
+- `DISCORD_TOKEN`
+- `BOT_MASTER_KEY`
+- `PAAS_MCP_URL`
+- `L2P_MCP_URL`
+
+Optional provider keys:
+
+- `OPENAI_API_KEY`
+- `LLM_GEMINI_KEY`
+- `ANTHROPIC_API_KEY`
+
+Optional model override:
+
+- `OPENAI_MODEL` defaults to `gpt-4.1`
 
 ## MCP Layer
 
@@ -58,22 +87,7 @@ The current backends are:
 
 ## Running The Bot
 
-The bot is designed to run as the `IPA_Discbot.bot` package.
-
-Set up a `.env` file with at least:
-
-- `DISCORD_TOKEN`
-- `BOT_MASTER_KEY`
-- `PAAS_MCP_URL`
-- `L2P_MCP_URL`
-
-If you plan to use an LLM provider directly during chat or natural-language solve, also set the provider key you need, such as:
-
-- `OPENAI_API_KEY`
-- `LLM_GEMINI_KEY`
-- `ANTHROPIC_API_KEY`
-
-Then start the bot from the repo root with:
+Start the bot from the repo root with:
 
 ```bash
 python3 -m IPA_Discbot.bot
