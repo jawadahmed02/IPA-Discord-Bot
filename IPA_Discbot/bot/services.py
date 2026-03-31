@@ -9,7 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from mcp_client import (
+from IPA_Discbot.mcp_client import (
     close_mcp_servers,
     connect_mcp_servers,
     list_all_mcp_tools,

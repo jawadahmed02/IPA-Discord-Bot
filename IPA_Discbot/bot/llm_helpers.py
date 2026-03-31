@@ -7,7 +7,11 @@ import threading
 import discord
 import llm
 
-from mcp_client import L2P_DOMAIN_TOOL, L2P_TASK_TOOL, get_mcp_tool_catalog
+from IPA_Discbot.mcp_client import (
+    L2P_DOMAIN_TOOL,
+    L2P_TASK_TOOL,
+    get_mcp_tool_catalog,
+)
 from .config import MODEL
 from .storage import get_effective_provider_key, get_user_model
 
