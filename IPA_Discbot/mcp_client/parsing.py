@@ -68,6 +68,38 @@ def extract_plan_text(payload: Any) -> str:
     return extracted or text.strip()
 
 
+def extract_val_text(payload: Any) -> str:
+    if isinstance(payload, dict):
+        output = payload.get("output")
+        if isinstance(output, dict):
+            for key in ("val.log", "stdout", "stderr"):
+                value = output.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        nested_result = payload.get("result")
+        if isinstance(nested_result, dict):
+            nested_text = extract_val_text(nested_result)
+            if nested_text:
+                return nested_text
+
+        for key in ("stdout", "stderr", "error"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        return json.dumps(payload).strip()
+
+    text = str(payload).strip()
+    if not text:
+        return ""
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    return extract_val_text(decoded)
+
+
 def require_dict_payload(tool_name: str, payload: Any) -> dict[str, Any]:
     if isinstance(payload, dict):
         return payload

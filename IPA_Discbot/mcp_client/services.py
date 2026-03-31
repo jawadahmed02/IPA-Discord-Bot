@@ -1,9 +1,20 @@
 from typing import Any
 
-from .config import L2P_DOMAIN_TOOL, L2P_TASK_TOOL, MCPServerName, PAAS_SOLVE_TOOL, mcp_server_url
+from .config import (
+    L2P_DOMAIN_TOOL,
+    L2P_TASK_TOOL,
+    MCPServerName,
+    PAAS_SOLVE_TOOL,
+    PAAS_VAL_TOOL,
+    PAAS_VALIDATE_DOMAIN_TOOL,
+    PAAS_VALIDATE_PLAN_TOOL,
+    PAAS_VALIDATE_TASK_TOOL,
+    mcp_server_url,
+)
 from .manager import call_mcp_tool, list_mcp_tools
 from .parsing import (
     compact_tool_arguments,
+    extract_val_text,
     default_expected_tools,
     extract_plan_text,
     format_tool_list,
@@ -23,6 +34,76 @@ async def solve_pddl(domain: str, problem: str, timeout_s: int = 30) -> str:
         {"domain": domain, "problem": problem, "timeout_s": timeout_s},
     )
     return extract_plan_text(result)
+
+
+async def validate_domain(
+    domain: str,
+    timeout_s: int = 30,
+) -> str:
+    result = await call_mcp_tool(
+        "paas",
+        PAAS_VALIDATE_DOMAIN_TOOL,
+        {
+            "domain": domain,
+            "timeout_s": timeout_s,
+        },
+    )
+    return str(result).strip()
+
+
+async def validate_plan(
+    domain: str,
+    problem: str,
+    plan: str,
+    timeout_s: int = 30,
+) -> str:
+    result = await call_mcp_tool(
+        "paas",
+        PAAS_VALIDATE_PLAN_TOOL,
+        {
+            "domain": domain,
+            "problem": problem,
+            "plan": plan,
+            "timeout_s": timeout_s,
+        },
+    )
+    return str(result).strip()
+
+
+async def validate_task(
+    domain: str,
+    problem: str,
+    timeout_s: int = 30,
+) -> str:
+    result = await call_mcp_tool(
+        "paas",
+        PAAS_VALIDATE_TASK_TOOL,
+        {
+            "domain": domain,
+            "problem": problem,
+            "timeout_s": timeout_s,
+        },
+    )
+    return str(result).strip()
+
+
+async def validate_plan_with_val(
+    domain: str,
+    problem: str,
+    plan: str,
+    timeout_s: int = 30,
+) -> str:
+    result = await call_mcp_tool(
+        "paas",
+        PAAS_VAL_TOOL,
+        {
+            "domain": domain,
+            "problem": problem,
+            "plan": plan,
+            "timeout_s": timeout_s,
+        },
+    )
+    return extract_val_text(result)
 
 
 async def update_domain_via_l2p(

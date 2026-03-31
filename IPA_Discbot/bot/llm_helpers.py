@@ -7,7 +7,7 @@ import threading
 import discord
 import llm
 
-from ..mcp_client import L2P_DOMAIN_TOOL, L2P_TASK_TOOL, get_mcp_tool_catalog
+from mcp_client import L2P_DOMAIN_TOOL, L2P_TASK_TOOL, get_mcp_tool_catalog
 from .config import MODEL
 from .storage import get_effective_provider_key, get_user_model
 
@@ -479,6 +479,211 @@ async def _llm_classify_member_request(message: discord.Message) -> dict:
         "requested_name": requested_name,
         "should_add_to_thread": should_add_to_thread,
     }
+
+
+async def _llm_classify_workflow_request(message: discord.Message) -> str:
+    prompt = (
+        "Classify this Discord message for a planning bot workflow.\n"
+        "Return only JSON with this schema:\n"
+        '{"intent":"plan|domain|problem|validate_plan|validate_domain|validate_task|tools|help|chat"}\n'
+        f"Message: {json.dumps(message.content or '')}"
+    )
+    system_prompt = (
+        "You classify whether a user is asking a planning bot to perform a tool-backed workflow or just chat. "
+        "Use `plan` when the user wants a plan or asks the bot to solve a planning task. "
+        "Use `domain` when the user wants a domain generated. "
+        "Use `problem` when the user wants a problem/task generated. "
+        "Use `validate_plan` when the user wants a plan checked or validated. "
+        "Use `validate_domain` when the user wants only a domain checked. "
+        "Use `validate_task` when the user wants a domain/problem pair checked. "
+        "Use `tools` when the user asks what tools are available. "
+        "Use `help` when the user asks what commands or capabilities exist. "
+        "Use `chat` for normal conversation, explanation, or anything that should not invoke a workflow. "
+        "Return only valid JSON."
+    )
+    data = await _request_llm_json(message, prompt, system_prompt)
+    intent = str(data.get("intent", "chat")).strip().lower()
+    if intent not in {
+        "plan",
+        "domain",
+        "problem",
+        "validate_plan",
+        "validate_domain",
+        "validate_task",
+        "tools",
+        "help",
+        "chat",
+    }:
+        return "chat"
+    return intent
+
+
+async def _edit_domain_system_prompt() -> str:
+    try:
+        tool_catalog = await get_mcp_tool_catalog()
+    except Exception:
+        return (
+            "Return only valid JSON with keys `domain_name`, `action_name`, and `domain_update`. "
+            "Use `domain_update` in the exact heading/block format expected by update_domain."
+        )
+
+    l2p_tools = {
+        str(tool.get("name", "")).strip(): tool for tool in tool_catalog.get("l2p", [])
+    }
+    domain_description = str(
+        l2p_tools.get(L2P_DOMAIN_TOOL, {}).get("description", "")
+    ).strip()
+    if not domain_description:
+        return (
+            "Return only valid JSON with keys `domain_name`, `action_name`, and `domain_update`. "
+            "Use `domain_update` in the exact heading/block format expected by update_domain."
+        )
+
+    return (
+        "You revise an existing planning domain according to a user's edit request. "
+        "Preserve the user's original intent and keep changes minimal. "
+        "Do not rewrite unrelated parts of the domain. "
+        "Return only valid JSON with this schema: "
+        "{\"domain_name\":\"snake_case_name\",\"action_name\":[\"snake_case_action\"],"
+        "\"domain_update\":\"text formatted for update_domain\"}. "
+        "The `domain_update` field must follow the `update_domain` tool description exactly:\n"
+        f"{domain_description}\n\n"
+        "Do not include markdown outside the JSON object."
+    )
+
+
+async def _edit_problem_system_prompt() -> str:
+    try:
+        tool_catalog = await get_mcp_tool_catalog()
+    except Exception:
+        return (
+            "Return only valid JSON with keys `domain_name`, `problem_name`, and `task_update`. "
+            "Use `task_update` in the exact heading/block format expected by update_task."
+        )
+
+    l2p_tools = {
+        str(tool.get("name", "")).strip(): tool for tool in tool_catalog.get("l2p", [])
+    }
+    task_description = str(
+        l2p_tools.get(L2P_TASK_TOOL, {}).get("description", "")
+    ).strip()
+    if not task_description:
+        return (
+            "Return only valid JSON with keys `domain_name`, `problem_name`, and `task_update`. "
+            "Use `task_update` in the exact heading/block format expected by update_task."
+        )
+
+    return (
+        "You revise an existing planning problem according to a user's edit request. "
+        "Preserve the user's original intent and keep changes minimal. "
+        "Do not rewrite unrelated parts of the problem. "
+        "Always include a complete, valid problem update with objects, initial state, and goal state information. "
+        "Never omit the goal section, even if it stays unchanged. "
+        "Return only valid JSON with this schema: "
+        "{\"domain_name\":\"snake_case_name\",\"problem_name\":\"snake_case_name\","
+        "\"task_update\":\"text formatted for update_task\"}. "
+        "The `task_update` field must follow the `update_task` tool description exactly:\n"
+        f"{task_description}\n\n"
+        "Do not include markdown outside the JSON object."
+    )
+
+
+async def _llm_domain_edit_from_instruction(
+    message: discord.Message,
+    instruction: str,
+    current_domain: str,
+    domain_name: str,
+    feedback: str | None = None,
+) -> dict:
+    prompt = (
+        "Revise this planning domain according to the user's instruction.\n"
+        "Return only JSON with keys domain_name, action_name, and domain_update.\n"
+        f"Current domain name: {json.dumps(domain_name)}\n"
+        f"Edit instruction: {json.dumps(instruction)}\n"
+        f"Current domain PDDL:\n{current_domain}"
+    )
+    if feedback:
+        prompt += (
+            "\nThe previous attempt failed after being sent to the planning tool. "
+            "Revise only what is necessary and keep the rest intact.\n"
+            f"Tool feedback: {json.dumps(feedback)}"
+        )
+    data = await _request_llm_json(message, prompt, await _edit_domain_system_prompt())
+    normalized = _normalize_server_update_payload(
+        {
+            "domain_name": data.get("domain_name") or domain_name,
+            "problem_name": "unused_problem",
+            "action_name": data.get("action_name"),
+            "domain_update": data.get("domain_update"),
+            "task_update": "unused",
+        }
+    )
+    if not normalized["domain_update"]:
+        raise RuntimeError("The model did not return `domain_update`.")
+    return normalized
+
+
+async def _llm_problem_edit_from_instruction(
+    message: discord.Message,
+    instruction: str,
+    current_problem: str,
+    domain_name: str,
+    problem_name: str,
+    feedback: str | None = None,
+) -> dict:
+    prompt = (
+        "Revise this planning problem according to the user's instruction.\n"
+        "Return only JSON with keys domain_name, problem_name, and task_update.\n"
+        "Keep the plan fixed and preserve unchanged objects, initial state facts, and goal facts unless the instruction or feedback requires a minimal change.\n"
+        "The revised task_update must remain complete and explicitly include the goal information.\n"
+        f"Current domain name: {json.dumps(domain_name)}\n"
+        f"Current problem name: {json.dumps(problem_name)}\n"
+        f"Edit instruction: {json.dumps(instruction)}\n"
+        f"Current problem PDDL:\n{current_problem}"
+    )
+    if feedback:
+        prompt += (
+            "\nThe previous attempt failed after being sent to the planning tool. "
+            "Revise only what is necessary and keep the rest intact.\n"
+            f"Tool feedback: {json.dumps(feedback)}"
+        )
+    data = await _request_llm_json(message, prompt, await _edit_problem_system_prompt())
+    normalized = _normalize_server_update_payload(
+        {
+            "domain_name": data.get("domain_name") or domain_name,
+            "problem_name": data.get("problem_name") or problem_name,
+            "action_name": None,
+            "domain_update": "unused",
+            "task_update": data.get("task_update"),
+        }
+    )
+    if not normalized["task_update"]:
+        raise RuntimeError("The model did not return `task_update`.")
+    return normalized
+
+
+async def _llm_plan_edit_from_instruction(
+    message: discord.Message,
+    instruction: str,
+    current_plan: str,
+) -> str:
+    prompt = (
+        "Revise this plan according to the user's instruction.\n"
+        "Return only JSON with this schema:\n"
+        '{"plan":"one action per line"}\n'
+        "Preserve unaffected steps and keep changes minimal.\n"
+        f"Edit instruction: {json.dumps(instruction)}\n"
+        f"Current plan:\n{current_plan}"
+    )
+    system_prompt = (
+        "You edit planning plans. Return only valid JSON. "
+        "The `plan` value must contain only the revised plan text, typically one action per line, with no markdown fences."
+    )
+    data = await _request_llm_json(message, prompt, system_prompt)
+    plan_text = str(data.get("plan", "")).strip()
+    if not plan_text:
+        raise RuntimeError("The model did not return a revised plan.")
+    return plan_text
 
 
 def _all_llm_model_ids() -> list[str]:

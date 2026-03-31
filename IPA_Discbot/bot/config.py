@@ -18,8 +18,10 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 DB_PATH = "bot.db"
 PENDING_MEMBER_CONFIRMATIONS: dict[tuple[int, int], dict] = {}
+LAST_SOLVE_ARTIFACTS: dict[tuple[int, int], dict[str, str]] = {}
+ARTIFACT_HISTORY: dict[tuple[int, int], list[dict[str, str]]] = {}
 GUILD_ID = 1376609949114699886

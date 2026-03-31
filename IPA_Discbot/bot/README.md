@@ -40,7 +40,7 @@ This package contains the Discord bot itself. It is responsible for loading runt
 From the repo root, run:
 
 ```bash
-python3 -m IPA_Discbot.bot
+python -m bot
 ```
 
 Before starting the bot, make sure your environment is set up with:

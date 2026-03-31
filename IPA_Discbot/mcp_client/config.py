@@ -8,6 +8,10 @@ load_dotenv()
 MCPServerName = Literal["paas", "l2p"]
 
 PAAS_SOLVE_TOOL = "paas_lama_first_solve"
+PAAS_VAL_TOOL = "paas_val_validate"
+PAAS_VALIDATE_DOMAIN_TOOL = "paas_pddl_validate_domain"
+PAAS_VALIDATE_PLAN_TOOL = "paas_pddl_validate_plan"
+PAAS_VALIDATE_TASK_TOOL = "paas_pddl_validate_task"
 L2P_DOMAIN_TOOL = "update_domain"
 L2P_TASK_TOOL = "update_task"
 

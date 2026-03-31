@@ -1,5 +1,6 @@
 import asyncio
 import difflib
+import io
 import json
 import re
 import traceback
@@ -8,24 +9,40 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..mcp_client import (
+from mcp_client import (
     close_mcp_servers,
     connect_mcp_servers,
     list_all_mcp_tools,
+    get_mcp_tool_catalog,
     solve_pddl,
     update_domain_via_l2p,
     update_task_via_l2p,
+    validate_plan_with_val,
+    validate_domain,
+    validate_plan,
+    validate_task,
 )
 from .llm_helpers import (
     _all_llm_model_ids,
+    _llm_classify_workflow_request,
+    _llm_domain_edit_from_instruction,
     _format_solve_reply,
     _llm_classify_confirmation_reply,
     _llm_classify_member_request,
+    _llm_plan_edit_from_instruction,
     _llm_plan_from_natural_language,
+    _llm_problem_edit_from_instruction,
     _parse_solve_response_text,
     llm_reply,
 )
-from .config import GUILD_ID, MODEL, PENDING_MEMBER_CONFIRMATIONS, bot
+from .config import (
+    ARTIFACT_HISTORY,
+    GUILD_ID,
+    LAST_SOLVE_ARTIFACTS,
+    MODEL,
+    PENDING_MEMBER_CONFIRMATIONS,
+    bot,
+)
 from .storage import (
     get_share_mode,
     get_recent_context,
@@ -97,12 +114,92 @@ def _format_mcp_tools_message(tool_map: dict[str, list[dict[str, str]]]) -> str:
     return "\n".join(lines).strip()
 
 
+def _format_single_server_tools_message(
+    server_name: str, tools: list[dict[str, str]]
+) -> str:
+    lines = [f"{server_name.upper()} tools:"]
+    if not tools:
+        lines.append("- none")
+        return "\n".join(lines)
+
+    for tool in tools:
+        name = tool.get("name", "unknown-tool")
+        description = _summarize_tool_description(tool.get("description", ""))
+        lines.append(f"- `{name}`: {description}")
+
+    return "\n".join(lines)
+
+
+def _format_help_message() -> str:
+    lines = [
+        "Available bot commands:",
+        "",
+        "Planning:",
+        "`!plan <request>` Solve a planning request from natural language, or attach domain/problem PDDL files with `!plan`.",
+        "`!help` Show this help message with a short description of each command.",
+        "`!domain <request>` Generate a planning domain from a natural-language request and return the domain PDDL.",
+        "`!problem <request>` Generate a planning problem from a natural-language request and return the problem PDDL.",
+        "",
+        "HITL Editing:",
+        "`!show <domain|problem|plan>` Show the current working artifact and return it as a file.",
+        "`!edit <domain|problem|plan> <instruction>` Revise one current artifact while preserving the rest of the workflow state.",
+        "`!undo <domain|problem|plan>` Restore the previous version of one artifact.",
+        "",
+        "Validation:",
+        "`!validate` Validate a plan against a domain and problem, using attachments or the last successful `!plan` output.",
+        "`!validate_domain` Validate a domain PDDL file with the PaaS domain validation tool.",
+        "`!validate_plan` Validate a domain/problem/plan triple with the PaaS plan validation tool.",
+        "`!validate_task` Validate a domain/problem pair with the PaaS task validation tool.",
+        "",
+        "Progress / Beta:",
+        "`!autovalidate` Beta: loop domain/problem repairs against VAL until the current plan passes or the retry limit is reached.",
+        "",
+        "MCP Tools:",
+        "`!paastools` List only the tools currently exposed by the connected PaaS MCP server.",
+        "`!tools` List the MCP tools currently exposed by the connected planning servers.",
+        "",
+        "Chat and Threads:",
+        "`!thread [topic]` Create a private thread in the current server channel for chatting with the bot.",
+        "`!chat` Toggle normal-message bot chat on or off for you in the current channel.",
+        "",
+        "Bot Settings:",
+        "`!share` Toggle whether other users may use your saved provider key when they do not have one.",
+        "`!save` Save the current bot session so its conversation log is kept after restart.",
+        "`/models` Show the available LLM model IDs you can choose from.",
+        "`/use <model_id>` Set which model the bot should use for your requests.",
+        "`/setkey <provider> <api_key>` Save your provider API key for `openai`, `gemini`, or `anthropic`.",
+    ]
+    return "\n".join(lines)
+
+
 def _pddl_from_l2p_payload(payload: dict[str, object], *keys: str) -> str:
     for key in keys:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _format_pddl_reply(kind: str, name: str, text: str) -> str:
+    title = f"Generated {kind} `{name}`:" if name else f"Generated {kind}:"
+    return f"{title}\n```lisp\n{text.strip()}\n```"
+
+
+def _format_domain_reply(domain_name: str, domain_text: str) -> str:
+    return _format_pddl_reply("domain", domain_name, domain_text)
+
+
+def _format_problem_reply(problem_name: str, problem_text: str) -> str:
+    return _format_pddl_reply("problem", problem_name, problem_text)
+
+
+def _safe_pddl_name(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", (value or "").strip()).strip("_")
+    return cleaned or fallback
+
+
+def _text_file(text: str, filename: str) -> discord.File:
+    return discord.File(io.BytesIO(text.encode("utf-8")), filename=filename)
 
 
 def _solve_output_has_action_steps(text: str) -> bool:
@@ -172,6 +269,814 @@ async def _extract_pddl_attachments(message: discord.Message) -> tuple[str, str]
         )
 
     return domain_text, problem_text
+
+
+async def _extract_val_attachments(message: discord.Message) -> tuple[str, str, str]:
+    attachments = list(message.attachments)
+    if len(attachments) < 3:
+        raise RuntimeError("Attach a domain file, a problem file, and a plan file.")
+
+    domain_text: str | None = None
+    problem_text: str | None = None
+    plan_text: str | None = None
+
+    for attachment in attachments:
+        filename = attachment.filename.lower()
+        content = await _read_text_attachment(attachment)
+
+        if domain_text is None and "domain" in filename:
+            domain_text = content
+            continue
+
+        if problem_text is None and "problem" in filename:
+            problem_text = content
+            continue
+
+        if plan_text is None and "plan" in filename:
+            plan_text = content
+
+    if domain_text is None or problem_text is None or plan_text is None:
+        text_files = [
+            attachment
+            for attachment in attachments
+            if attachment.filename.lower().endswith((".pddl", ".txt", ".plan", ".sol"))
+        ]
+        if len(text_files) >= 3:
+            contents: dict[str, str] = {}
+            for attachment in text_files[:3]:
+                contents[attachment.filename] = await _read_text_attachment(attachment)
+
+            ordered_contents = list(contents.values())
+            if domain_text is None:
+                domain_text = ordered_contents[0]
+            if problem_text is None:
+                problem_text = ordered_contents[1]
+            if plan_text is None:
+                plan_text = ordered_contents[2]
+
+    if domain_text is None or problem_text is None or plan_text is None:
+        raise RuntimeError(
+            "Could not identify all three files. Name them with `domain`, `problem`, and `plan`, "
+            "or attach exactly three text files in that order."
+        )
+
+    return domain_text, problem_text, plan_text
+
+
+async def _extract_domain_attachment(message: discord.Message) -> str:
+    attachments = list(message.attachments)
+    if not attachments:
+        raise RuntimeError("Attach a domain PDDL file.")
+
+    for attachment in attachments:
+        filename = attachment.filename.lower()
+        if "domain" in filename:
+            return await _read_text_attachment(attachment)
+
+    text_files = [
+        attachment
+        for attachment in attachments
+        if attachment.filename.lower().endswith((".pddl", ".txt"))
+    ]
+    if text_files:
+        return await _read_text_attachment(text_files[0])
+
+    raise RuntimeError("Could not identify a domain file.")
+
+
+def _solve_artifacts_key(message: discord.Message) -> tuple[int, int]:
+    return (message.channel.id, message.author.id)
+
+
+def _working_artifacts(message: discord.Message) -> dict[str, str]:
+    return LAST_SOLVE_ARTIFACTS.setdefault(_solve_artifacts_key(message), {})
+
+
+def _push_artifact_history(message: discord.Message) -> None:
+    key = _solve_artifacts_key(message)
+    current = LAST_SOLVE_ARTIFACTS.get(key)
+    if not current:
+        return
+    snapshot = {k: str(v) for k, v in current.items()}
+    history = ARTIFACT_HISTORY.setdefault(key, [])
+    history.append(snapshot)
+    if len(history) > 10:
+        del history[:-10]
+
+
+def _update_working_artifacts(message: discord.Message, **updates: str) -> dict[str, str]:
+    current = _working_artifacts(message)
+    changed = False
+    for key, value in updates.items():
+        if value is None:
+            continue
+        value_str = str(value)
+        if current.get(key) != value_str:
+            changed = True
+    if changed and current:
+        _push_artifact_history(message)
+    current.update({k: str(v) for k, v in updates.items() if v is not None})
+    return current
+
+
+def _artifact_text(current: dict[str, str], artifact_type: str) -> str:
+    return str(current.get(artifact_type, "")).strip()
+
+
+def _artifact_filename(current: dict[str, str], artifact_type: str) -> str:
+    if artifact_type == "domain":
+        return f"{_safe_pddl_name(current.get('domain_name', ''), 'domain')}.pddl"
+    if artifact_type == "problem":
+        return f"{_safe_pddl_name(current.get('problem_name', ''), 'problem')}.pddl"
+    return "plan.txt"
+
+
+def _artifact_reply_text(current: dict[str, str], artifact_type: str) -> str:
+    text = _artifact_text(current, artifact_type)
+    if not text:
+        return ""
+    if artifact_type == "domain":
+        return _format_domain_reply(str(current.get("domain_name", "")).strip(), text)
+    if artifact_type == "problem":
+        return _format_problem_reply(str(current.get("problem_name", "")).strip(), text)
+    return f"Current plan:\n```text\n{text}\n```"
+
+
+def _val_output_indicates_valid(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    positive_markers = (
+        "plan valid",
+        "plan executed successfully",
+        "successful plans:",
+        "plan verification result: valid",
+        "plan verification result: success",
+        "plan successfully validated",
+    )
+    negative_markers = (
+        "error:",
+        "unknown type",
+        "type-checking",
+        "goal not satisfied",
+        "unsatisfied",
+        "invalid",
+        "failed",
+        "problem in domain definition",
+        "problem in problem definition",
+        "problem in plan definition",
+        "precondition",
+        "cannot be applied",
+        "violat",
+    )
+    if any(marker in lowered for marker in negative_markers):
+        return False
+    return any(marker in lowered for marker in positive_markers)
+
+
+def _store_last_solve_artifacts(
+    message: discord.Message,
+    domain_text: str,
+    problem_text: str,
+    plan_text: str,
+    domain_name: str,
+    problem_name: str,
+) -> None:
+    LAST_SOLVE_ARTIFACTS[_solve_artifacts_key(message)] = {
+        "domain": domain_text,
+        "problem": problem_text,
+        "plan": plan_text,
+        "domain_name": domain_name,
+        "problem_name": problem_name,
+    }
+
+
+async def _update_domain_with_fallback(
+    *,
+    domain_update: str,
+    domain_name: str,
+    action_name: str | list[str] | None,
+) -> dict[str, object]:
+    try:
+        return await update_domain_via_l2p(
+            domain_update=domain_update,
+            domain_name=domain_name,
+            action_name=action_name,
+        )
+    except RuntimeError as e:
+        message = str(e)
+        if "More action_name values were provided than action updates" not in message:
+            raise
+        return await update_domain_via_l2p(
+            domain_update=domain_update,
+            domain_name=domain_name,
+        )
+
+
+async def _run_plan_request(
+    message: discord.Message,
+    request_text: str | None = None,
+) -> tuple[str, list[discord.File]]:
+    domain_name = "domain"
+    problem_name = "problem"
+
+    if message.attachments:
+        domain_text, problem_text = await _extract_pddl_attachments(message)
+        result = await solve_pddl(domain_text, problem_text)
+        result = _parse_solve_response_text(result)
+    else:
+        request_text = (request_text or "").strip()
+        if not request_text:
+            raise RuntimeError(
+                "Use `!plan` with a domain and problem attachment pair, or `!plan <natural language request>`."
+            )
+
+        result = ""
+        retry_feedback: str | None = None
+
+        for _ in range(2):
+            llm_plan = await _llm_plan_from_natural_language(
+                message, request_text, retry_feedback
+            )
+            domain_name = str(llm_plan.get("domain_name", "")).strip()
+            problem_name = str(llm_plan.get("problem_name", "")).strip()
+            domain_update = str(llm_plan.get("domain_update", "")).strip()
+            task_update = str(llm_plan.get("task_update", "")).strip()
+            action_name = llm_plan.get("action_name")
+
+            if not domain_name or not problem_name or not domain_update or not task_update:
+                raise RuntimeError("The model did not return a complete domain/task update payload.")
+
+            try:
+                domain_payload = await _update_domain_with_fallback(
+                    domain_update=domain_update,
+                    domain_name=domain_name,
+                    action_name=action_name,
+                )
+                task_payload = await update_task_via_l2p(
+                    task_update=task_update,
+                    domain_name=domain_name,
+                    problem_name=problem_name,
+                )
+            except RuntimeError as e:
+                retry_feedback = str(e)
+                continue
+
+            domain_text = _pddl_from_l2p_payload(
+                domain_payload,
+                "domain_pddl",
+                "domain",
+                "pddl",
+            )
+            problem_text = _pddl_from_l2p_payload(
+                task_payload,
+                "task_pddl",
+                "problem_pddl",
+                "problem",
+                "task",
+                "pddl",
+            )
+
+            if not domain_text or not problem_text:
+                raise RuntimeError("Failed to generate PDDL from the natural-language request.")
+
+            raw_result = await solve_pddl(domain_text, problem_text)
+            result = _parse_solve_response_text(raw_result)
+            if _planner_output_indicates_failure(result) and not _solve_output_has_action_steps(
+                result
+            ):
+                retry_feedback = result
+                continue
+            break
+        else:
+            raise RuntimeError(retry_feedback or "Failed to produce a valid plan.")
+
+    _store_last_solve_artifacts(
+        message, domain_text, problem_text, result, domain_name, problem_name
+    )
+    safe_domain_name = _safe_pddl_name(domain_name, "domain")
+    safe_problem_name = _safe_pddl_name(problem_name, "problem")
+    files = [
+        _text_file(domain_text, f"{safe_domain_name}.pddl"),
+        _text_file(problem_text, f"{safe_problem_name}.pddl"),
+        _text_file(result, "plan.txt"),
+    ]
+    return "Generated planning artifacts.", files
+
+
+async def _run_domain_request(message: discord.Message, request_text: str) -> tuple[str, str]:
+    retry_feedback: str | None = None
+    domain_name = ""
+    domain_text = ""
+
+    for _ in range(2):
+        llm_plan = await _llm_plan_from_natural_language(
+            message, request_text, retry_feedback
+        )
+        domain_name = str(llm_plan.get("domain_name", "")).strip()
+        domain_update = str(llm_plan.get("domain_update", "")).strip()
+        action_name = llm_plan.get("action_name")
+
+        if not domain_name or not domain_update:
+            raise RuntimeError("The model did not return a complete domain update payload.")
+
+        try:
+            domain_payload = await _update_domain_with_fallback(
+                domain_update=domain_update,
+                domain_name=domain_name,
+                action_name=action_name,
+            )
+        except RuntimeError as e:
+            retry_feedback = str(e)
+            continue
+
+        domain_text = _pddl_from_l2p_payload(
+            domain_payload,
+            "domain_pddl",
+            "domain",
+            "pddl",
+        )
+        if not domain_text:
+            raise RuntimeError("Failed to generate domain PDDL from the request.")
+        break
+    else:
+        raise RuntimeError(retry_feedback or "Failed to generate a valid domain.")
+
+    return domain_name, domain_text
+
+
+async def _run_problem_request(message: discord.Message, request_text: str) -> tuple[str, str]:
+    retry_feedback: str | None = None
+    domain_name = ""
+    problem_name = ""
+    problem_text = ""
+
+    for _ in range(2):
+        llm_plan = await _llm_plan_from_natural_language(
+            message, request_text, retry_feedback
+        )
+        domain_name = str(llm_plan.get("domain_name", "")).strip()
+        problem_name = str(llm_plan.get("problem_name", "")).strip()
+        task_update = str(llm_plan.get("task_update", "")).strip()
+
+        if not domain_name or not problem_name or not task_update:
+            raise RuntimeError("The model did not return a complete problem update payload.")
+
+        try:
+            task_payload = await update_task_via_l2p(
+                task_update=task_update,
+                domain_name=domain_name,
+                problem_name=problem_name,
+            )
+        except RuntimeError as e:
+            retry_feedback = str(e)
+            continue
+
+        problem_text = _pddl_from_l2p_payload(
+            task_payload,
+            "task_pddl",
+            "problem_pddl",
+            "problem",
+            "task",
+            "pddl",
+        )
+        if not problem_text:
+            raise RuntimeError("Failed to generate problem PDDL from the request.")
+        break
+    else:
+        raise RuntimeError(retry_feedback or "Failed to generate a valid problem.")
+
+    return problem_name, problem_text
+
+
+async def _run_validate_plan_request(message: discord.Message) -> str:
+    if message.attachments:
+        domain_text, problem_text, plan_text = await _extract_val_attachments(message)
+    else:
+        cached = LAST_SOLVE_ARTIFACTS.get(_solve_artifacts_key(message))
+        if not cached:
+            return "Nothing to validate"
+        domain_text = str(cached.get("domain", "")).strip()
+        problem_text = str(cached.get("problem", "")).strip()
+        plan_text = str(cached.get("plan", "")).strip()
+        if not domain_text or not problem_text or not plan_text:
+            return "Nothing to validate"
+    result = await validate_plan(domain_text, problem_text, plan_text)
+    return _truncate_discord_message(result or "Plan validation returned an empty response.")
+
+
+async def _run_validate_domain_request(message: discord.Message) -> str:
+    if message.attachments:
+        domain_text = await _extract_domain_attachment(message)
+    else:
+        cached = LAST_SOLVE_ARTIFACTS.get(_solve_artifacts_key(message))
+        if not cached:
+            return "Nothing to validate"
+        domain_text = str(cached.get("domain", "")).strip()
+        if not domain_text:
+            return "Nothing to validate"
+    result = await validate_domain(domain_text)
+    return _truncate_discord_message(result or "Domain validation returned an empty response.")
+
+
+async def _run_validate_task_request(message: discord.Message) -> str:
+    if message.attachments:
+        domain_text, problem_text = await _extract_pddl_attachments(message)
+    else:
+        cached = LAST_SOLVE_ARTIFACTS.get(_solve_artifacts_key(message))
+        if not cached:
+            return "Nothing to validate"
+        domain_text = str(cached.get("domain", "")).strip()
+        problem_text = str(cached.get("problem", "")).strip()
+        if not domain_text or not problem_text:
+            return "Nothing to validate"
+    result = await validate_task(domain_text, problem_text)
+    return _truncate_discord_message(result or "Task validation returned an empty response.")
+
+
+async def _run_autovalidate_request(
+    message: discord.Message,
+    max_iterations: int = 3,
+) -> tuple[str, list[discord.File]]:
+    current = _working_artifacts(message)
+    domain_text = _artifact_text(current, "domain")
+    problem_text = _artifact_text(current, "problem")
+    plan_text = _artifact_text(current, "plan")
+    domain_name = str(current.get("domain_name", "domain")).strip() or "domain"
+    problem_name = str(current.get("problem_name", "problem")).strip() or "problem"
+
+    if not domain_text or not problem_text or not plan_text:
+        raise RuntimeError("No current domain, problem, and plan to validate. Run `!plan` first.")
+
+    working_domain = domain_text
+    working_problem = problem_text
+    val_text = ""
+
+    for iteration in range(1, max_iterations + 1):
+        val_text = await validate_plan_with_val(working_domain, working_problem, plan_text)
+        if _val_output_indicates_valid(val_text):
+            updated = _update_working_artifacts(
+                message,
+                domain=working_domain,
+                problem=working_problem,
+                plan=plan_text,
+                domain_name=domain_name,
+                problem_name=problem_name,
+            )
+            files = [
+                _text_file(working_domain, _artifact_filename(updated, "domain")),
+                _text_file(working_problem, _artifact_filename(updated, "problem")),
+                _text_file(plan_text, _artifact_filename(updated, "plan")),
+                _text_file(val_text, "val.log"),
+            ]
+            return (
+                f"VAL accepted the plan after {iteration} iteration(s).",
+                files,
+            )
+
+        feedback = (
+            "Revise the current domain and problem so the existing plan remains unchanged and becomes valid under VAL. "
+            "Make the smallest possible changes, preserve the user's original intent, and do not rewrite unrelated parts.\n"
+            f"VAL feedback:\n{val_text}"
+        )
+        repair_feedback = val_text
+        repaired = False
+        for _ in range(2):
+            domain_edit = await _llm_domain_edit_from_instruction(
+                message,
+                feedback,
+                working_domain,
+                domain_name,
+                repair_feedback,
+            )
+            problem_edit = await _llm_problem_edit_from_instruction(
+                message,
+                feedback,
+                working_problem,
+                domain_name,
+                problem_name,
+                repair_feedback,
+            )
+
+            try:
+                domain_payload = await _update_domain_with_fallback(
+                    domain_update=str(domain_edit.get("domain_update", "")).strip(),
+                    domain_name=str(domain_edit.get("domain_name", domain_name)).strip() or domain_name,
+                    action_name=domain_edit.get("action_name"),
+                )
+                task_payload = await update_task_via_l2p(
+                    task_update=str(problem_edit.get("task_update", "")).strip(),
+                    domain_name=str(problem_edit.get("domain_name", domain_name)).strip() or domain_name,
+                    problem_name=str(problem_edit.get("problem_name", problem_name)).strip() or problem_name,
+                )
+            except RuntimeError as e:
+                repair_feedback = str(e)
+                feedback = (
+                    "Revise the current domain and problem so the existing plan remains unchanged and becomes valid under VAL. "
+                    "Make the smallest possible changes, preserve the user's original intent, and do not rewrite unrelated parts. "
+                    "The previous repair attempt also failed inside the L2P tools, so return a more complete and server-safe update.\n"
+                    f"VAL feedback:\n{val_text}\n\nL2P feedback:\n{repair_feedback}"
+                )
+                continue
+
+            domain_name = str(domain_edit.get("domain_name", domain_name)).strip() or domain_name
+            problem_name = str(problem_edit.get("problem_name", problem_name)).strip() or problem_name
+            working_domain = _pddl_from_l2p_payload(domain_payload, "domain_pddl", "domain", "pddl")
+            working_problem = _pddl_from_l2p_payload(
+                task_payload, "task_pddl", "problem_pddl", "problem", "task", "pddl"
+            )
+            if not working_domain or not working_problem:
+                raise RuntimeError("Repair loop failed to produce revised domain/problem PDDL.")
+            repaired = True
+            break
+
+        if not repaired:
+            raise RuntimeError(
+                f"Repair loop could not produce a valid domain/problem update.\n\nLast tool feedback:\n{repair_feedback}"
+            )
+
+    raise RuntimeError(
+        f"VAL still rejected the plan after {max_iterations} iteration(s).\n\nLast VAL output:\n{val_text}"
+    )
+
+
+def _normalize_artifact_type(raw: str) -> str | None:
+    value = raw.strip().lower()
+    if value in {"domain", "problem", "plan"}:
+        return value
+    return None
+
+
+def _detect_artifact_request(text: str) -> tuple[str, str, str] | None:
+    normalized = " ".join((text or "").strip().split())
+    lowered = normalized.lower()
+    show_match = re.match(r"^(show|display)\s+(the\s+)?(domain|problem|plan)\b", lowered)
+    if show_match:
+        artifact_type = show_match.group(3)
+        return ("show", artifact_type, "")
+
+    undo_match = re.match(r"^(undo|revert|restore)\s+(the\s+)?(domain|problem|plan)\b", lowered)
+    if undo_match:
+        artifact_type = undo_match.group(3)
+        return ("undo", artifact_type, "")
+
+    edit_match = re.match(
+        r"^(edit|change|update|fix|revise)\s+(the\s+)?(domain|problem|plan)\b[:\s,-]*(.*)$",
+        normalized,
+        re.IGNORECASE,
+    )
+    if edit_match:
+        artifact_type = edit_match.group(3).lower()
+        instruction = edit_match.group(4).strip()
+        return ("edit", artifact_type, instruction)
+
+    for artifact_type in ("domain", "problem", "plan"):
+        if artifact_type not in lowered:
+            continue
+        if any(
+            marker in lowered
+            for marker in ("don't like", "do not like", "should", "needs to", "must", "wrong")
+        ):
+            return ("edit", artifact_type, normalized)
+    return None
+
+
+async def _run_show_artifact_request(
+    message: discord.Message, artifact_type: str
+) -> tuple[str, list[discord.File] | None]:
+    current = _working_artifacts(message)
+    text = _artifact_text(current, artifact_type)
+    if not text:
+        raise RuntimeError(f"No current {artifact_type} to show.")
+    reply_text = _artifact_reply_text(current, artifact_type)
+    files = [_text_file(text, _artifact_filename(current, artifact_type))]
+    return reply_text, files
+
+
+async def _run_edit_domain_request(message: discord.Message, instruction: str) -> tuple[str, list[discord.File]]:
+    current = _working_artifacts(message)
+    current_domain = _artifact_text(current, "domain")
+    if not current_domain:
+        raise RuntimeError("No current domain to edit. Generate or plan something first.")
+
+    retry_feedback: str | None = None
+    domain_name = str(current.get("domain_name", "domain")).strip() or "domain"
+    for _ in range(2):
+        edit = await _llm_domain_edit_from_instruction(
+            message,
+            instruction,
+            current_domain,
+            domain_name,
+            retry_feedback,
+        )
+        try:
+            domain_payload = await _update_domain_with_fallback(
+                domain_update=str(edit.get("domain_update", "")).strip(),
+                domain_name=str(edit.get("domain_name", domain_name)).strip() or domain_name,
+                action_name=edit.get("action_name"),
+            )
+        except RuntimeError as e:
+            retry_feedback = str(e)
+            continue
+
+        domain_name = str(edit.get("domain_name", domain_name)).strip() or domain_name
+        domain_text = _pddl_from_l2p_payload(domain_payload, "domain_pddl", "domain", "pddl")
+        if not domain_text:
+            raise RuntimeError("Failed to generate revised domain PDDL.")
+        current = _update_working_artifacts(message, domain=domain_text, domain_name=domain_name)
+        return (
+            _format_domain_reply(domain_name, domain_text),
+            [_text_file(domain_text, _artifact_filename(current, "domain"))],
+        )
+    raise RuntimeError(retry_feedback or "Failed to revise the domain.")
+
+
+async def _run_edit_problem_request(message: discord.Message, instruction: str) -> tuple[str, list[discord.File]]:
+    current = _working_artifacts(message)
+    current_problem = _artifact_text(current, "problem")
+    if not current_problem:
+        raise RuntimeError("No current problem to edit. Generate or plan something first.")
+
+    retry_feedback: str | None = None
+    domain_name = str(current.get("domain_name", "domain")).strip() or "domain"
+    problem_name = str(current.get("problem_name", "problem")).strip() or "problem"
+    for _ in range(2):
+        edit = await _llm_problem_edit_from_instruction(
+            message,
+            instruction,
+            current_problem,
+            domain_name,
+            problem_name,
+            retry_feedback,
+        )
+        try:
+            task_payload = await update_task_via_l2p(
+                task_update=str(edit.get("task_update", "")).strip(),
+                domain_name=str(edit.get("domain_name", domain_name)).strip() or domain_name,
+                problem_name=str(edit.get("problem_name", problem_name)).strip() or problem_name,
+            )
+        except RuntimeError as e:
+            retry_feedback = str(e)
+            continue
+
+        domain_name = str(edit.get("domain_name", domain_name)).strip() or domain_name
+        problem_name = str(edit.get("problem_name", problem_name)).strip() or problem_name
+        problem_text = _pddl_from_l2p_payload(
+            task_payload, "task_pddl", "problem_pddl", "problem", "task", "pddl"
+        )
+        if not problem_text:
+            raise RuntimeError("Failed to generate revised problem PDDL.")
+        current = _update_working_artifacts(
+            message,
+            problem=problem_text,
+            problem_name=problem_name,
+            domain_name=domain_name,
+        )
+        return (
+            _format_problem_reply(problem_name, problem_text),
+            [_text_file(problem_text, _artifact_filename(current, "problem"))],
+        )
+    raise RuntimeError(retry_feedback or "Failed to revise the problem.")
+
+
+async def _run_edit_plan_request(message: discord.Message, instruction: str) -> tuple[str, list[discord.File]]:
+    current = _working_artifacts(message)
+    current_plan = _artifact_text(current, "plan")
+    if not current_plan:
+        raise RuntimeError("No current plan to edit. Generate or plan something first.")
+
+    revised_plan = await _llm_plan_edit_from_instruction(message, instruction, current_plan)
+    current = _update_working_artifacts(message, plan=revised_plan)
+    reply_text = f"Updated plan:\n```text\n{revised_plan}\n```"
+    return reply_text, [_text_file(revised_plan, _artifact_filename(current, "plan"))]
+
+
+async def _run_undo_request(message: discord.Message, artifact_type: str) -> tuple[str, list[discord.File] | None]:
+    key = _solve_artifacts_key(message)
+    history = ARTIFACT_HISTORY.get(key, [])
+    if not history:
+        raise RuntimeError("No previous artifact version to restore.")
+
+    current = _working_artifacts(message)
+    restored_index = None
+    for index in range(len(history) - 1, -1, -1):
+        snapshot = history[index]
+        if _artifact_text(snapshot, artifact_type):
+            restored_index = index
+            current.update(snapshot)
+            del history[index:]
+            break
+    if restored_index is None:
+        raise RuntimeError(f"No previous {artifact_type} version to restore.")
+
+    reply_text = _artifact_reply_text(current, artifact_type)
+    files = [_text_file(_artifact_text(current, artifact_type), _artifact_filename(current, artifact_type))]
+    return reply_text, files
+
+
+async def _handle_workflow_request(message: discord.Message) -> bool:
+    text = (message.content or "").strip()
+    if not text:
+        return False
+
+    direct_request = _detect_artifact_request(text)
+    if direct_request is not None:
+        action, artifact_type, instruction = direct_request
+        try:
+            if action == "show":
+                reply_text, files = await _run_show_artifact_request(message, artifact_type)
+            elif action == "undo":
+                reply_text, files = await _run_undo_request(message, artifact_type)
+            elif action == "edit":
+                if not instruction:
+                    await message.reply(
+                        f"Tell me how to revise the {artifact_type}.",
+                        mention_author=False,
+                    )
+                    return True
+                if artifact_type == "domain":
+                    reply_text, files = await _run_edit_domain_request(message, instruction)
+                elif artifact_type == "problem":
+                    reply_text, files = await _run_edit_problem_request(message, instruction)
+                else:
+                    reply_text, files = await _run_edit_plan_request(message, instruction)
+            else:
+                return False
+        except Exception as e:
+            traceback.print_exc()
+            await message.reply(
+                _truncate_discord_message(f"HITL workflow failed: {type(e).__name__}: {e}"),
+                mention_author=False,
+            )
+            return True
+
+        messages = _split_discord_message(reply_text)
+        await message.reply(messages[0], files=files or None, mention_author=False)
+        for chunk in messages[1:]:
+            await message.channel.send(chunk)
+        return True
+
+    try:
+        intent = await _llm_classify_workflow_request(message)
+    except Exception as e:
+        print("[LLM WORKFLOW CLASSIFIER ERROR]", type(e).__name__, e)
+        return False
+
+    if intent == "chat":
+        return False
+
+    async with message.channel.typing():
+        try:
+            if intent == "help":
+                reply_text = _format_help_message()
+                files = None
+            elif intent == "tools":
+                reply_text = _format_mcp_tools_message(await list_all_mcp_tools())
+                files = None
+            elif intent == "plan":
+                reply_text, files = await _run_plan_request(message, text)
+            elif intent == "domain":
+                domain_name, domain_text = await _run_domain_request(message, text)
+                _update_working_artifacts(message, domain=domain_text, domain_name=domain_name)
+                reply_text = _format_domain_reply(domain_name, domain_text)
+                files = None
+            elif intent == "problem":
+                problem_name, problem_text = await _run_problem_request(message, text)
+                _update_working_artifacts(
+                    message,
+                    problem=problem_text,
+                    problem_name=problem_name,
+                )
+                reply_text = _format_problem_reply(problem_name, problem_text)
+                files = None
+            elif intent == "validate_plan":
+                reply_text = await _run_validate_plan_request(message)
+                files = None
+            elif intent == "validate_domain":
+                reply_text = await _run_validate_domain_request(message)
+                files = None
+            elif intent == "validate_task":
+                reply_text = await _run_validate_task_request(message)
+                files = None
+            else:
+                return False
+        except Exception as e:
+            traceback.print_exc()
+            await message.reply(
+                _truncate_discord_message(f"Workflow failed: {type(e).__name__}: {e}"),
+                mention_author=False,
+            )
+            return True
+
+    if files:
+        await message.reply(_truncate_discord_message(reply_text), files=files, mention_author=False)
+        return True
+
+    messages = _split_discord_message(reply_text)
+    await message.reply(messages[0], mention_author=False)
+    for chunk in messages[1:]:
+        await message.channel.send(chunk)
+    return True
 
 
 def _normalize_member_text(value: str) -> str:
@@ -441,8 +1346,7 @@ async def _handle_solve_request(message: discord.Message) -> bool:
 
     async with message.channel.typing():
         try:
-            domain_text, problem_text = await _extract_pddl_attachments(message)
-            result = await solve_pddl(domain_text, problem_text)
+            reply_text, files = await _run_plan_request(message, None)
         except Exception as e:
             traceback.print_exc()
             await message.reply(
@@ -451,11 +1355,7 @@ async def _handle_solve_request(message: discord.Message) -> bool:
             )
             return True
 
-    result = _parse_solve_response_text(result)
-    await message.reply(
-        _truncate_discord_message(_format_solve_reply(result)),
-        mention_author=False,
-    )
+    await message.reply(reply_text, files=files, mention_author=False)
     return True
 
 
@@ -552,6 +1452,9 @@ async def _handle_conversation_message(message: discord.Message):
     if await _handle_solve_request(message):
         return
 
+    if await _handle_workflow_request(message):
+        return
+
     text = (message.content or "").strip()
     if not text:
         return
@@ -644,6 +1547,14 @@ async def thread(ctx: commands.Context, *, topic: str | None = None):
 
 
 @bot.command()
+async def help(ctx: commands.Context):
+    messages = _split_discord_message(_format_help_message())
+    await ctx.reply(messages[0])
+    for chunk in messages[1:]:
+        await ctx.send(chunk)
+
+
+@bot.command()
 async def chat(ctx: commands.Context):
     user_id = str(ctx.author.id)
     channel_id = str(ctx.channel.id)
@@ -659,90 +1570,244 @@ async def chat(ctx: commands.Context):
     )
 
 
-@bot.command()
-async def solve(ctx: commands.Context, *, request: str | None = None):
+@bot.command(name="plan")
+async def plan_cmd(ctx: commands.Context, *, request: str | None = None):
     async with ctx.typing():
         try:
-            if ctx.message.attachments:
-                domain_text, problem_text = await _extract_pddl_attachments(ctx.message)
-                result = await solve_pddl(domain_text, problem_text)
-            else:
-                request_text = (request or "").strip()
-                if not request_text:
-                    await ctx.reply(
-                        "Use `!solve` with a domain and problem attachment pair, or `!solve <natural language request>`."
-                    )
-                    return
-
-                result = ""
-                retry_feedback: str | None = None
-
-                for _ in range(2):
-                    llm_plan = await _llm_plan_from_natural_language(
-                        ctx.message, request_text, retry_feedback
-                    )
-                    domain_name = str(llm_plan.get("domain_name", "")).strip()
-                    problem_name = str(llm_plan.get("problem_name", "")).strip()
-                    domain_update = str(llm_plan.get("domain_update", "")).strip()
-                    task_update = str(llm_plan.get("task_update", "")).strip()
-                    action_name = llm_plan.get("action_name")
-
-                    if not domain_name or not problem_name or not domain_update or not task_update:
-                        raise RuntimeError("The model did not return a complete domain/task update payload.")
-
-                    try:
-                        domain_payload = await update_domain_via_l2p(
-                            domain_update=domain_update,
-                            domain_name=domain_name,
-                            action_name=action_name,
-                        )
-                        task_payload = await update_task_via_l2p(
-                            task_update=task_update,
-                            domain_name=domain_name,
-                            problem_name=problem_name,
-                        )
-                    except RuntimeError as e:
-                        retry_feedback = str(e)
-                        continue
-
-                    domain_text = _pddl_from_l2p_payload(
-                        domain_payload,
-                        "domain_pddl",
-                        "domain",
-                        "pddl",
-                    )
-                    problem_text = _pddl_from_l2p_payload(
-                        task_payload,
-                        "task_pddl",
-                        "problem_pddl",
-                        "problem",
-                        "task",
-                        "pddl",
-                    )
-
-                    if not domain_text or not problem_text:
-                        raise RuntimeError("Failed to generate PDDL from the natural-language request.")
-
-                    raw_result = await solve_pddl(domain_text, problem_text)
-                    result = _parse_solve_response_text(raw_result)
-                    if _planner_output_indicates_failure(result) and not _solve_output_has_action_steps(
-                        result
-                    ):
-                        retry_feedback = result
-                        continue
-                    break
-                else:
-                    raise RuntimeError(retry_feedback or "Failed to produce a valid plan.")
+            reply_text, files = await _run_plan_request(ctx.message, request)
         except Exception as e:
             traceback.print_exc()
             await ctx.reply(
                 _truncate_discord_message(f"Solve failed: {type(e).__name__}: {e}")
             )
             return
+    await ctx.reply(reply_text, files=files)
 
-    if ctx.message.attachments:
-        result = _parse_solve_response_text(result)
-    await ctx.reply(_truncate_discord_message(_format_solve_reply(result)))
+
+@bot.command(name="domain")
+async def domain_cmd(ctx: commands.Context, *, request: str | None = None):
+    request_text = (request or "").strip()
+    if not request_text:
+        await ctx.reply("Use `!domain <natural language request>`.")
+        return
+
+    async with ctx.typing():
+        try:
+            domain_name, domain_text = await _run_domain_request(ctx.message, request_text)
+            _update_working_artifacts(ctx.message, domain=domain_text, domain_name=domain_name)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Domain generation failed: {type(e).__name__}: {e}")
+            )
+            return
+    reply_text = _format_domain_reply(domain_name, domain_text)
+    messages = _split_discord_message(reply_text)
+    await ctx.reply(
+        messages[0],
+        file=_text_file(domain_text, f"{_safe_pddl_name(domain_name, 'domain')}.pddl"),
+    )
+    for chunk in messages[1:]:
+        await ctx.send(chunk)
+
+
+@bot.command(name="problem")
+async def problem_cmd(ctx: commands.Context, *, request: str | None = None):
+    request_text = (request or "").strip()
+    if not request_text:
+        await ctx.reply("Use `!problem <natural language request>`.")
+        return
+
+    async with ctx.typing():
+        try:
+            problem_name, problem_text = await _run_problem_request(ctx.message, request_text)
+            _update_working_artifacts(
+                ctx.message, problem=problem_text, problem_name=problem_name
+            )
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Problem generation failed: {type(e).__name__}: {e}")
+            )
+            return
+    reply_text = _format_problem_reply(problem_name, problem_text)
+    messages = _split_discord_message(reply_text)
+    await ctx.reply(
+        messages[0],
+        file=_text_file(problem_text, f"{_safe_pddl_name(problem_name, 'problem')}.pddl"),
+    )
+    for chunk in messages[1:]:
+        await ctx.send(chunk)
+
+
+@bot.command(name="show")
+async def show_cmd(ctx: commands.Context, artifact_type: str):
+    normalized = _normalize_artifact_type(artifact_type)
+    if normalized is None:
+        await ctx.reply("Use `!show domain`, `!show problem`, or `!show plan`.")
+        return
+
+    async with ctx.typing():
+        try:
+            reply_text, files = await _run_show_artifact_request(ctx.message, normalized)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Show failed: {type(e).__name__}: {e}")
+            )
+            return
+
+    messages = _split_discord_message(reply_text)
+    await ctx.reply(messages[0], files=files or None)
+    for chunk in messages[1:]:
+        await ctx.send(chunk)
+
+
+@bot.command(name="edit")
+async def edit_cmd(ctx: commands.Context, artifact_type: str, *, instruction: str | None = None):
+    normalized = _normalize_artifact_type(artifact_type)
+    if normalized is None:
+        await ctx.reply("Use `!edit domain ...`, `!edit problem ...`, or `!edit plan ...`.")
+        return
+
+    edit_instruction = (instruction or "").strip()
+    if not edit_instruction:
+        await ctx.reply(f"Tell me how to revise the {normalized}.")
+        return
+
+    async with ctx.typing():
+        try:
+            if normalized == "domain":
+                reply_text, files = await _run_edit_domain_request(ctx.message, edit_instruction)
+            elif normalized == "problem":
+                reply_text, files = await _run_edit_problem_request(ctx.message, edit_instruction)
+            else:
+                reply_text, files = await _run_edit_plan_request(ctx.message, edit_instruction)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Edit failed: {type(e).__name__}: {e}")
+            )
+            return
+
+    messages = _split_discord_message(reply_text)
+    await ctx.reply(messages[0], files=files or None)
+    for chunk in messages[1:]:
+        await ctx.send(chunk)
+
+
+@bot.command(name="undo")
+async def undo_cmd(ctx: commands.Context, artifact_type: str):
+    normalized = _normalize_artifact_type(artifact_type)
+    if normalized is None:
+        await ctx.reply("Use `!undo domain`, `!undo problem`, or `!undo plan`.")
+        return
+
+    async with ctx.typing():
+        try:
+            reply_text, files = await _run_undo_request(ctx.message, normalized)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Undo failed: {type(e).__name__}: {e}")
+            )
+            return
+
+    messages = _split_discord_message(reply_text)
+    await ctx.reply(messages[0], files=files or None)
+    for chunk in messages[1:]:
+        await ctx.send(chunk)
+
+
+@bot.command(name="validate")
+async def validate_cmd(ctx: commands.Context):
+    async with ctx.typing():
+        try:
+            result = await _run_validate_plan_request(ctx.message)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Plan validation failed: {type(e).__name__}: {e}")
+            )
+            return
+    await ctx.reply(result)
+
+
+@bot.command(name="validate_plan")
+async def validate_plan_cmd(ctx: commands.Context):
+    await validate_cmd(ctx)
+
+
+@bot.command(name="validate_domain")
+async def validate_domain_cmd(ctx: commands.Context):
+    async with ctx.typing():
+        try:
+            result = await _run_validate_domain_request(ctx.message)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(
+                    f"Domain validation failed: {type(e).__name__}: {e}"
+                )
+            )
+            return
+
+    await ctx.reply(result)
+
+
+@bot.command(name="validate_task")
+async def validate_task_cmd(ctx: commands.Context):
+    async with ctx.typing():
+        try:
+            result = await _run_validate_task_request(ctx.message)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(
+                    f"Task validation failed: {type(e).__name__}: {e}"
+                )
+            )
+            return
+
+    await ctx.reply(result)
+
+
+@bot.command(name="autovalidate")
+async def autovalidate_cmd(ctx: commands.Context):
+    async with ctx.typing():
+        try:
+            reply_text, files = await _run_autovalidate_request(ctx.message)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Auto-validate failed: {type(e).__name__}: {e}")
+            )
+            return
+
+    await ctx.reply(reply_text, files=files)
+
+
+@bot.command(name="paastools")
+async def paastools_cmd(ctx: commands.Context):
+    async with ctx.typing():
+        try:
+            tool_catalog = await get_mcp_tool_catalog()
+            paas_tools = tool_catalog.get("paas", [])
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(
+                    f"PaaS tool listing failed: {type(e).__name__}: {e}"
+                )
+            )
+            return
+
+    messages = _split_discord_message(
+        _format_single_server_tools_message("paas", paas_tools)
+    )
+    await ctx.reply(messages[0])
+    for chunk in messages[1:]:
+        await ctx.send(chunk)
 
 
 @bot.command()
