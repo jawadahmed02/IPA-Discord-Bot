@@ -187,10 +187,11 @@ def _format_help_message() -> str:
     lines = [
         "Available bot commands:",
         "",
+        "`!help` Show this help message with a short description of each command.",
+        "",
         "Planning:",
         "`!plan <request>` Solve a planning request from natural language, or attach domain/problem PDDL files with `!plan`.",
         "`!plan` Re-solve using the current stored domain and problem in this channel for you.",
-        "`!help` Show this help message with a short description of each command.",
         "`!domain <request>` Generate a planning domain from a natural-language request and return the domain PDDL.",
         "`!problem <request>` Generate a planning problem from a natural-language request and return the problem PDDL.",
         "",
@@ -202,7 +203,7 @@ def _format_help_message() -> str:
         "`!undo <domain|problem|plan>` Restore the previous version of one artifact.",
         "",
         "Validation:",
-        "`!validate` Validate a plan against a domain and problem, using attachments or the last successful `!plan` output.",
+        "`!validate` Validate a plan against a domain and problem with VAL, using attachments or the last successful `!plan` output.",
         "`!validate_domain` Validate a domain PDDL file with the PaaS domain validation tool.",
         "`!validate_plan` Validate a domain/problem/plan triple with the PaaS plan validation tool.",
         "`!validate_task` Validate a domain/problem pair with the PaaS task validation tool.",
@@ -605,6 +606,12 @@ def _summarize_validation_failure(details: str) -> str:
     if not text:
         return ""
 
+    precondition_failure_patterns = (
+        r"precondition[^\n]*not satisfied[^\n]*",
+        r"precondition[^\n]*is false[^\n]*",
+        r"precondition[^\n]*failed[^\n]*",
+        r"failed precondition[^\n]*",
+    )
     priority_patterns = (
         r"pddl\.[A-Za-z0-9_.]*Error:\s*[^\n]+",
         r"[A-Za-z0-9_.]*Error:\s*[^\n]+",
@@ -613,7 +620,7 @@ def _summarize_validation_failure(details: str) -> str:
         r"type-?checking[^\n]*",
         r"goal not satisfied[^\n]*",
         r"cannot be applied[^\n]*",
-        r"precondition[^\n]*",
+        *precondition_failure_patterns,
     )
     for pattern in priority_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -666,12 +673,19 @@ def _validation_indicates_valid(kind: str, raw: object) -> bool:
     plan_negative_markers = (
         "goal not satisfied",
         "unsatisfied",
-        "precondition",
         "cannot be applied",
+    )
+    plan_negative_patterns = (
+        r"precondition[^\n]*not satisfied",
+        r"precondition[^\n]*is false",
+        r"precondition[^\n]*failed",
+        r"failed precondition",
     )
 
     negative_markers = common_negative_markers + (plan_negative_markers if kind == "plan" else ())
     if any(marker in lowered for marker in negative_markers):
+        return False
+    if kind == "plan" and any(re.search(pattern, text, re.IGNORECASE) for pattern in plan_negative_patterns):
         return False
 
     status = str(payload.get("status", "")).strip().lower()
@@ -945,18 +959,39 @@ async def _run_problem_request(message: discord.Message, request_text: str) -> t
     return problem_name, problem_text
 
 
-async def _run_validate_plan_request(message: discord.Message) -> str:
+async def _extract_current_plan_validation_inputs(
+    message: discord.Message,
+) -> tuple[str, str, str] | None:
     if message.attachments:
-        domain_text, problem_text, plan_text = await _extract_val_attachments(message)
-    else:
-        cached = LAST_SOLVE_ARTIFACTS.get(_solve_artifacts_key(message))
-        if not cached:
-            return "Nothing to validate"
-        domain_text = str(cached.get("domain", "")).strip()
-        problem_text = str(cached.get("problem", "")).strip()
-        plan_text = str(cached.get("plan", "")).strip()
-        if not domain_text or not problem_text or not plan_text:
-            return "Nothing to validate"
+        return await _extract_val_attachments(message)
+
+    cached = LAST_SOLVE_ARTIFACTS.get(_solve_artifacts_key(message))
+    if not cached:
+        return None
+
+    domain_text = str(cached.get("domain", "")).strip()
+    problem_text = str(cached.get("problem", "")).strip()
+    plan_text = str(cached.get("plan", "")).strip()
+    if not domain_text or not problem_text or not plan_text:
+        return None
+
+    return domain_text, problem_text, plan_text
+
+
+async def _run_validate_request(message: discord.Message) -> str:
+    inputs = await _extract_current_plan_validation_inputs(message)
+    if inputs is None:
+        return "Nothing to validate"
+    domain_text, problem_text, plan_text = inputs
+    result = await validate_plan_with_val(domain_text, problem_text, plan_text)
+    return _format_validation_result("plan", result or "VAL validation returned an empty response.")
+
+
+async def _run_validate_plan_request(message: discord.Message) -> str:
+    inputs = await _extract_current_plan_validation_inputs(message)
+    if inputs is None:
+        return "Nothing to validate"
+    domain_text, problem_text, plan_text = inputs
     result = await validate_plan(domain_text, problem_text, plan_text)
     return _format_validation_result("plan", result or "Plan validation returned an empty response.")
 
@@ -2084,6 +2119,20 @@ async def undo_cmd(ctx: commands.Context, artifact_type: str):
 async def validate_cmd(ctx: commands.Context):
     async with ctx.typing():
         try:
+            result = await _run_validate_request(ctx.message)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"VAL validation failed: {type(e).__name__}: {e}")
+            )
+            return
+    await ctx.reply(result)
+
+
+@bot.command(name="validate_plan")
+async def validate_plan_cmd(ctx: commands.Context):
+    async with ctx.typing():
+        try:
             result = await _run_validate_plan_request(ctx.message)
         except Exception as e:
             traceback.print_exc()
@@ -2092,11 +2141,6 @@ async def validate_cmd(ctx: commands.Context):
             )
             return
     await ctx.reply(result)
-
-
-@bot.command(name="validate_plan")
-async def validate_plan_cmd(ctx: commands.Context):
-    await validate_cmd(ctx)
 
 
 @bot.command(name="validate_domain")
