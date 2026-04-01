@@ -666,6 +666,104 @@ async def _llm_problem_edit_from_instruction(
     return normalized
 
 
+def _clean_pddl_text(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+async def _llm_domain_pddl_edit_from_instruction(
+    message: discord.Message,
+    instruction: str,
+    current_domain: str,
+    domain_name: str,
+    feedback: str | None = None,
+) -> dict:
+    prompt = (
+        "Revise this planning domain PDDL according to the user's instruction.\n"
+        "Return only JSON with this schema:\n"
+        '{"domain_name":"snake_case_name","domain_pddl":"complete revised domain PDDL"}\n'
+        "Preserve the user's original intent and keep changes minimal.\n"
+        "Return the full revised domain PDDL, not a diff and not update instructions.\n"
+        f"Current domain name: {json.dumps(domain_name)}\n"
+        f"Edit instruction: {json.dumps(instruction)}\n"
+        f"Current domain PDDL:\n{current_domain}"
+    )
+    if feedback:
+        prompt += (
+            "\nThe previous revised domain was invalid. "
+            "Fix only what is necessary and return one complete valid domain PDDL document.\n"
+            f"Validation feedback: {json.dumps(feedback)}"
+        )
+    system_prompt = (
+        "You edit planning domain PDDL directly. "
+        "Return only valid JSON. "
+        "The `domain_pddl` value must be the complete revised domain file with no markdown fences and no commentary."
+    )
+    data = await _request_llm_json(message, prompt, system_prompt)
+    revised_name = _to_pddl_identifier(str(data.get("domain_name") or domain_name).strip(), domain_name or "domain")
+    domain_pddl = _clean_pddl_text(str(data.get("domain_pddl", "")))
+    if not domain_pddl:
+        raise RuntimeError("The model did not return revised domain PDDL.")
+    return {"domain_name": revised_name, "domain_pddl": domain_pddl}
+
+
+async def _llm_problem_pddl_edit_from_instruction(
+    message: discord.Message,
+    instruction: str,
+    current_domain: str,
+    current_problem: str,
+    domain_name: str,
+    problem_name: str,
+    feedback: str | None = None,
+) -> dict:
+    prompt = (
+        "Revise this planning problem PDDL according to the user's instruction.\n"
+        "Return only JSON with this schema:\n"
+        '{"domain_name":"snake_case_name","problem_name":"snake_case_name","problem_pddl":"complete revised problem PDDL"}\n'
+        "Preserve the user's original intent and keep changes minimal.\n"
+        "Return the full revised problem PDDL, not a diff and not update instructions.\n"
+        "Keep object names, initial facts, and goal facts unchanged unless the instruction requires a targeted edit.\n"
+        f"Current domain name: {json.dumps(domain_name)}\n"
+        f"Current problem name: {json.dumps(problem_name)}\n"
+        f"Edit instruction: {json.dumps(instruction)}\n"
+        f"Current domain PDDL:\n{current_domain}\n\n"
+        f"Current problem PDDL:\n{current_problem}"
+    )
+    if feedback:
+        prompt += (
+            "\nThe previous revised problem was invalid. "
+            "Fix only what is necessary and return one complete valid problem PDDL document.\n"
+            f"Validation feedback: {json.dumps(feedback)}"
+        )
+    system_prompt = (
+        "You edit planning problem PDDL directly. "
+        "Return only valid JSON. "
+        "The `problem_pddl` value must be the complete revised problem file with no markdown fences and no commentary."
+    )
+    data = await _request_llm_json(message, prompt, system_prompt)
+    revised_domain_name = _to_pddl_identifier(
+        str(data.get("domain_name") or domain_name).strip(), domain_name or "domain"
+    )
+    revised_problem_name = _to_pddl_identifier(
+        str(data.get("problem_name") or problem_name).strip(), problem_name or "problem"
+    )
+    problem_pddl = _clean_pddl_text(str(data.get("problem_pddl", "")))
+    if not problem_pddl:
+        raise RuntimeError("The model did not return revised problem PDDL.")
+    return {
+        "domain_name": revised_domain_name,
+        "problem_name": revised_problem_name,
+        "problem_pddl": problem_pddl,
+    }
+
+
 async def _llm_plan_edit_from_instruction(
     message: discord.Message,
     instruction: str,
@@ -688,6 +786,36 @@ async def _llm_plan_edit_from_instruction(
     if not plan_text:
         raise RuntimeError("The model did not return a revised plan.")
     return plan_text
+
+
+async def _llm_explain_artifact(
+    message: discord.Message,
+    artifact_type: str,
+    artifact_text: str,
+) -> str:
+    prompt = (
+        f"Give a short, general explanation of what this planning {artifact_type} does in normal natural language.\n"
+        "Keep it high level and easy to follow.\n"
+        "Do not go into too much detail unless it is necessary to understand the main idea.\n"
+        "Do not restate the full PDDL verbatim.\n"
+        "Prefer a brief paragraph or a few short bullets.\n"
+        f"{artifact_type.capitalize()} content:\n{artifact_text}"
+    )
+    system_prompt = (
+        "You explain planning artifacts for users who may not know PDDL. "
+        "Be accurate, concise, and high level. "
+        "Focus on the main purpose and behavior, not line-by-line details."
+    )
+    selected_model = get_user_model(str(message.author.id)) or MODEL
+    return (
+        await asyncio.to_thread(
+            _run_llm_prompt_for_user_sync,
+            str(message.author.id),
+            selected_model,
+            prompt,
+            system_prompt,
+        )
+    ).strip()
 
 
 def _all_llm_model_ids() -> list[str]:

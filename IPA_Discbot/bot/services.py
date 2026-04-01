@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import difflib
 import io
 import json
@@ -25,11 +26,14 @@ from IPA_Discbot.mcp_client import (
 from .llm_helpers import (
     _all_llm_model_ids,
     _llm_classify_workflow_request,
+    _llm_domain_pddl_edit_from_instruction,
     _llm_domain_edit_from_instruction,
+    _llm_explain_artifact,
     _format_solve_reply,
     _llm_classify_confirmation_reply,
     _llm_classify_member_request,
     _llm_plan_edit_from_instruction,
+    _llm_problem_pddl_edit_from_instruction,
     _llm_plan_from_natural_language,
     _llm_problem_edit_from_instruction,
     _parse_solve_response_text,
@@ -37,6 +41,7 @@ from .llm_helpers import (
 )
 from .config import (
     ARTIFACT_HISTORY,
+    BOT_SESSION_ID,
     GUILD_ID,
     LAST_SOLVE_ARTIFACTS,
     MODEL,
@@ -48,8 +53,10 @@ from .storage import (
     get_recent_context,
     get_user_model,
     is_chat_enabled,
+    load_saved_working_artifacts,
     log_message,
     save_current_session,
+    save_working_artifacts_snapshot,
     save_provider_key,
     set_chat_enabled,
     set_share_mode,
@@ -67,6 +74,52 @@ def _truncate_discord_message(text: str, limit: int = 1900) -> str:
 def _split_discord_message(text: str, limit: int = 1900) -> list[str]:
     if len(text) <= limit:
         return [text]
+
+    fenced_match = re.match(r"^([\s\S]*?)```([a-zA-Z0-9_-]*)\n([\s\S]*?)\n```$", text)
+    if fenced_match:
+        prefix = fenced_match.group(1).rstrip()
+        info = fenced_match.group(2)
+        body = fenced_match.group(3)
+        fence_open = f"```{info}\n"
+        fence_close = "\n```"
+
+        chunks: list[str] = []
+        body_lines = body.splitlines()
+        current_body: list[str] = []
+        current_prefix = prefix
+
+        for line in body_lines:
+            candidate_body = "\n".join(current_body + [line])
+            candidate = (
+                (current_prefix + "\n" if current_prefix else "")
+                + fence_open
+                + candidate_body
+                + fence_close
+            )
+            if current_body and len(candidate) > limit:
+                completed = (
+                    (current_prefix + "\n" if current_prefix else "")
+                    + fence_open
+                    + "\n".join(current_body)
+                    + fence_close
+                )
+                chunks.append(completed)
+                current_body = [line]
+                current_prefix = ""
+            else:
+                current_body.append(line)
+
+        if current_body:
+            completed = (
+                (current_prefix + "\n" if current_prefix else "")
+                + fence_open
+                + "\n".join(current_body)
+                + fence_close
+            )
+            chunks.append(completed)
+
+        if chunks:
+            return chunks
 
     chunks: list[str] = []
     current: list[str] = []
@@ -136,12 +189,15 @@ def _format_help_message() -> str:
         "",
         "Planning:",
         "`!plan <request>` Solve a planning request from natural language, or attach domain/problem PDDL files with `!plan`.",
+        "`!plan` Re-solve using the current stored domain and problem in this channel for you.",
         "`!help` Show this help message with a short description of each command.",
         "`!domain <request>` Generate a planning domain from a natural-language request and return the domain PDDL.",
         "`!problem <request>` Generate a planning problem from a natural-language request and return the problem PDDL.",
         "",
         "HITL Editing:",
         "`!show <domain|problem|plan>` Show the current working artifact and return it as a file.",
+        "`!files` Send the current stored domain, problem, and plan as files.",
+        "`!explain <domain|problem|plan>` Explain the current working artifact in normal language.",
         "`!edit <domain|problem|plan> <instruction>` Revise one current artifact while preserving the rest of the workflow state.",
         "`!undo <domain|problem|plan>` Restore the previous version of one artifact.",
         "",
@@ -182,7 +238,16 @@ def _pddl_from_l2p_payload(payload: dict[str, object], *keys: str) -> str:
 
 def _format_pddl_reply(kind: str, name: str, text: str) -> str:
     title = f"Generated {kind} `{name}`:" if name else f"Generated {kind}:"
-    return f"{title}\n```lisp\n{text.strip()}\n```"
+    stripped = text.strip()
+    fence = "lisp" if stripped.startswith("(define") else "text"
+    return f"{title}\n```{fence}\n{stripped}\n```"
+
+
+def _format_updated_pddl_reply(kind: str, name: str, text: str) -> str:
+    title = f"Updated {kind} `{name}`:" if name else f"Updated {kind}:"
+    stripped = text.strip()
+    fence = "lisp" if stripped.startswith("(define") else "text"
+    return f"{title}\n```{fence}\n{stripped}\n```"
 
 
 def _format_domain_reply(domain_name: str, domain_text: str) -> str:
@@ -221,6 +286,126 @@ def _planner_output_indicates_failure(text: str) -> bool:
         "error:",
     )
     return any(marker in lowered for marker in failure_markers)
+
+
+def _parse_requested_grid_shape(request_text: str) -> tuple[int, int] | None:
+    text = (request_text or "").lower()
+    match = re.search(r"\b(\d+)\s*x\s*(\d+)\s+grid\b", text)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+
+    match = re.search(r"\b(\d+)\s+by\s+(\d+)\s+grid\b", text)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+
+    return None
+
+
+def _request_mentions_top_left_start(request_text: str) -> bool:
+    text = (request_text or "").lower()
+    return "top left" in text and ("start" in text or "starting" in text or "begin" in text)
+
+
+def _request_mentions_bottom_right_goal(request_text: str) -> bool:
+    text = (request_text or "").lower()
+    return "bottom right" in text
+
+
+def _problem_contains_cell(problem_text: str, row: int, col: int) -> bool:
+    return re.search(rf"\bcell_{row}_{col}\b", problem_text) is not None
+
+
+def _problem_sets_start_cell(problem_text: str, row: int, col: int) -> bool:
+    return re.search(rf"\(at\s+cell_{row}_{col}\)", problem_text) is not None
+
+
+def _problem_sets_goal_cell(problem_text: str, row: int, col: int) -> bool:
+    goal_match = re.search(r"\(:goal\b(.*?)\)\s*\)\s*$", problem_text, re.IGNORECASE | re.DOTALL)
+    if goal_match is None:
+        goal_match = re.search(r"\(:goal\b(.*)", problem_text, re.IGNORECASE | re.DOTALL)
+    goal_block = goal_match.group(1) if goal_match else problem_text
+    return re.search(rf"\(at\s+cell_{row}_{col}\)", goal_block) is not None
+
+
+def _problem_uses_out_of_bounds_cell(problem_text: str, rows: int, cols: int) -> bool:
+    for row_text, col_text in re.findall(r"\bcell_(\d+)_(\d+)\b", problem_text):
+        row = int(row_text)
+        col = int(col_text)
+        if row >= rows or col >= cols:
+            return True
+    return False
+
+
+def _check_request_matches_generated_problem(request_text: str, problem_text: str) -> str | None:
+    grid_shape = _parse_requested_grid_shape(request_text)
+    if grid_shape is not None:
+        rows, cols = grid_shape
+        max_row = rows - 1
+        max_col = cols - 1
+        if not _problem_contains_cell(problem_text, max_row, max_col):
+            return (
+                f"The request asked for a {rows}x{cols} grid, so the generated problem must include "
+                f"`cell_{max_row}_{max_col}`. It does not."
+            )
+        if _problem_uses_out_of_bounds_cell(problem_text, rows, cols):
+            return "The generated problem uses cell indices outside the requested grid size."
+        if _request_mentions_top_left_start(request_text) and not _problem_sets_start_cell(problem_text, 0, 0):
+            return "The request starts at the top-left corner, so the initial state must place the agent at `cell_0_0`."
+        if _request_mentions_bottom_right_goal(request_text) and not _problem_sets_goal_cell(problem_text, max_row, max_col):
+            return (
+                f"The request targets the bottom-right corner of a {rows}x{cols} grid, "
+                f"so the goal must be `cell_{max_row}_{max_col}`."
+            )
+    return None
+
+
+def _extract_plan_steps(plan_text: str) -> list[list[str]]:
+    steps: list[list[str]] = []
+    for raw_line in plan_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(";"):
+            continue
+        if not (line.startswith("(") and line.endswith(")")):
+            continue
+        tokens = line[1:-1].split()
+        if tokens:
+            steps.append(tokens)
+    return steps
+
+
+def _check_request_matches_generated_plan(request_text: str, plan_text: str) -> str | None:
+    grid_shape = _parse_requested_grid_shape(request_text)
+    if grid_shape is None:
+        return None
+
+    rows, cols = grid_shape
+    max_row = rows - 1
+    max_col = cols - 1
+    steps = _extract_plan_steps(plan_text)
+    if not steps:
+        return "The generated plan did not contain any recognizable action steps."
+
+    if _request_mentions_top_left_start(request_text):
+        first_args = steps[0][1:]
+        if not first_args or first_args[0] != "cell_0_0":
+            return "The request starts at the top-left corner, so the plan must start from `cell_0_0`."
+
+    if _request_mentions_bottom_right_goal(request_text):
+        last_args = steps[-1][1:]
+        if len(last_args) < 2 or last_args[1] != f"cell_{max_row}_{max_col}":
+            return (
+                f"The request targets the bottom-right corner of a {rows}x{cols} grid, "
+                f"so the final move must end at `cell_{max_row}_{max_col}`."
+            )
+
+    minimum_steps = (rows - 1) + (cols - 1)
+    if len(steps) < minimum_steps:
+        return (
+            f"A top-left to bottom-right path on a {rows}x{cols} grid cannot be shorter than "
+            f"{minimum_steps} moves, but the generated plan has only {len(steps)}."
+        )
+
+    return None
 
 
 async def _read_text_attachment(attachment: discord.Attachment) -> str:
@@ -348,8 +533,43 @@ def _solve_artifacts_key(message: discord.Message) -> tuple[int, int]:
     return (message.channel.id, message.author.id)
 
 
+def _latest_artifact_key_for_user(user_id: int) -> tuple[int, int] | None:
+    for key in reversed(list(LAST_SOLVE_ARTIFACTS.keys())):
+        if key[1] != user_id:
+            continue
+        artifacts = LAST_SOLVE_ARTIFACTS.get(key, {})
+        if any(str(artifacts.get(name, "")).strip() for name in ("domain", "problem", "plan")):
+            return key
+    return None
+
+
 def _working_artifacts(message: discord.Message) -> dict[str, str]:
-    return LAST_SOLVE_ARTIFACTS.setdefault(_solve_artifacts_key(message), {})
+    key = _solve_artifacts_key(message)
+    current = LAST_SOLVE_ARTIFACTS.get(key)
+    if current is not None:
+        return current
+
+    fallback_key = _latest_artifact_key_for_user(message.author.id)
+    if fallback_key is not None and fallback_key != key:
+        LAST_SOLVE_ARTIFACTS[key] = {
+            k: str(v) for k, v in LAST_SOLVE_ARTIFACTS.get(fallback_key, {}).items()
+        }
+        fallback_history = ARTIFACT_HISTORY.get(fallback_key, [])
+        if fallback_history:
+            ARTIFACT_HISTORY[key] = [
+                {k: str(v) for k, v in snapshot.items()} for snapshot in fallback_history
+            ]
+        return LAST_SOLVE_ARTIFACTS[key]
+
+    return LAST_SOLVE_ARTIFACTS.setdefault(key, {})
+
+
+def _persist_artifacts_if_session_saved() -> None:
+    save_working_artifacts_snapshot(
+        BOT_SESSION_ID,
+        LAST_SOLVE_ARTIFACTS,
+        ARTIFACT_HISTORY,
+    )
 
 
 def _push_artifact_history(message: discord.Message) -> None:
@@ -376,6 +596,8 @@ def _update_working_artifacts(message: discord.Message, **updates: str) -> dict[
     if changed and current:
         _push_artifact_history(message)
     current.update({k: str(v) for k, v in updates.items() if v is not None})
+    if changed:
+        _persist_artifacts_if_session_saved()
     return current
 
 
@@ -434,6 +656,181 @@ def _val_output_indicates_valid(text: str) -> bool:
     return any(marker in lowered for marker in positive_markers)
 
 
+def _parse_loose_structured_text(text: str) -> dict | None:
+    stripped = (text or "").strip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    try:
+        decoded = json.loads(stripped)
+    except json.JSONDecodeError:
+        try:
+            decoded = ast.literal_eval(stripped)
+        except (ValueError, SyntaxError):
+            return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _extract_validation_payload(raw: object) -> dict:
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        payload = _parse_loose_structured_text(str(raw)) or {}
+
+    while isinstance(payload.get("result"), dict):
+        payload = payload["result"]
+    return payload
+
+
+def _collect_validation_text(payload: dict) -> str:
+    texts: list[str] = []
+
+    def _add(value: object) -> None:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped not in texts:
+                texts.append(stripped)
+
+    output = payload.get("output")
+    if isinstance(output, dict):
+        for key in ("val.log", "pddl_domain.log", "pddl_problem.log", "pddl_plan.log", "stdout", "stderr"):
+            _add(output.get(key))
+        for key, value in output.items():
+            if key not in {"val.log", "pddl_domain.log", "pddl_problem.log", "pddl_plan.log", "stdout", "stderr"}:
+                _add(value)
+    else:
+        _add(output)
+
+    for key in ("stdout", "stderr", "error"):
+        _add(payload.get(key))
+
+    raw = payload.get("raw")
+    if isinstance(raw, dict):
+        nested = raw.get("result")
+        if isinstance(nested, dict):
+            for key in ("output", "stdout", "stderr", "error"):
+                value = nested.get(key)
+                if isinstance(value, dict):
+                    for subkey in ("val.log", "pddl_domain.log", "pddl_problem.log", "pddl_plan.log", "stdout", "stderr"):
+                        _add(value.get(subkey))
+                    for _, subvalue in value.items():
+                        _add(subvalue)
+                else:
+                    _add(value)
+
+    return "\n\n".join(texts).strip()
+
+
+def _summarize_validation_failure(details: str) -> str:
+    text = (details or "").strip()
+    if not text:
+        return ""
+
+    priority_patterns = (
+        r"pddl\.[A-Za-z0-9_.]*Error:\s*[^\n]+",
+        r"[A-Za-z0-9_.]*Error:\s*[^\n]+",
+        r"problem in (?:domain|problem|plan) definition[^\n]*",
+        r"unknown type[^\n]*",
+        r"type-?checking[^\n]*",
+        r"goal not satisfied[^\n]*",
+        r"cannot be applied[^\n]*",
+        r"precondition[^\n]*",
+    )
+    for pattern in priority_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("("):
+            continue
+        if stripped.startswith("File "):
+            continue
+        if stripped.lower().startswith("traceback"):
+            continue
+        if stripped.startswith("```"):
+            continue
+        return stripped
+
+    return ""
+
+
+def _validation_kind_labels(kind: str) -> tuple[str, str]:
+    if kind == "domain":
+        return ("Domain", "domain")
+    if kind == "task":
+        return ("Task", "task")
+    return ("Plan", "plan")
+
+
+def _validation_indicates_valid(kind: str, raw: object) -> bool:
+    payload = _extract_validation_payload(raw)
+    text = _collect_validation_text(payload) or str(raw or "")
+    lowered = text.lower()
+
+    common_negative_markers = (
+        "error:",
+        "unknown type",
+        "type-checking",
+        "invalid",
+        "failed",
+        "problem in domain definition",
+        "problem in problem definition",
+        "problem in plan definition",
+        "violat",
+        "timed out",
+        "timeout",
+    )
+    plan_negative_markers = (
+        "goal not satisfied",
+        "unsatisfied",
+        "precondition",
+        "cannot be applied",
+    )
+
+    negative_markers = common_negative_markers + (plan_negative_markers if kind == "plan" else ())
+    if any(marker in lowered for marker in negative_markers):
+        return False
+
+    status = str(payload.get("status", "")).strip().lower()
+    if status == "ok":
+        return True
+
+    if kind == "plan":
+        return _val_output_indicates_valid(text)
+    return False
+
+
+def _format_validation_result(kind: str, raw: object) -> str:
+    title, noun = _validation_kind_labels(kind)
+    payload = _extract_validation_payload(raw)
+    details = _collect_validation_text(payload)
+    check_url = str(payload.get("check_url", "")).strip()
+    is_valid = _validation_indicates_valid(kind, raw)
+    failure_summary = _summarize_validation_failure(details) if not is_valid else ""
+
+    if is_valid:
+        message = f"{title} validation passed."
+    else:
+        message = f"{title} validation failed."
+        if failure_summary:
+            message += f"\n\nReason: `{failure_summary}`"
+
+    if details:
+        message += f"\n\nDetails:\n```text\n{details}\n```"
+    elif not is_valid:
+        fallback = str(raw).strip()
+        if fallback:
+            message += f"\n\nDetails:\n```text\n{fallback}\n```"
+
+    if check_url:
+        message += f"\n\nCheck URL: {check_url}"
+
+    return _truncate_discord_message(message)
+
+
 def _store_last_solve_artifacts(
     message: discord.Message,
     domain_text: str,
@@ -441,14 +838,18 @@ def _store_last_solve_artifacts(
     plan_text: str,
     domain_name: str,
     problem_name: str,
+    **extra_artifacts: str,
 ) -> None:
-    LAST_SOLVE_ARTIFACTS[_solve_artifacts_key(message)] = {
+    artifacts = {
         "domain": domain_text,
         "problem": problem_text,
         "plan": plan_text,
         "domain_name": domain_name,
         "problem_name": problem_name,
     }
+    artifacts.update({k: str(v) for k, v in extra_artifacts.items() if v is not None})
+    LAST_SOLVE_ARTIFACTS[_solve_artifacts_key(message)] = artifacts
+    _persist_artifacts_if_session_saved()
 
 
 async def _update_domain_with_fallback(
@@ -487,81 +888,117 @@ async def _run_plan_request(
     else:
         request_text = (request_text or "").strip()
         if not request_text:
-            raise RuntimeError(
-                "Use `!plan` with a domain and problem attachment pair, or `!plan <natural language request>`."
-            )
+            current = _working_artifacts(message)
+            domain_text = _artifact_text(current, "domain")
+            problem_text = _artifact_text(current, "problem")
+            domain_name = str(current.get("domain_name", domain_name)).strip() or domain_name
+            problem_name = str(current.get("problem_name", problem_name)).strip() or problem_name
 
-        result = ""
-        retry_feedback: str | None = None
-
-        for _ in range(2):
-            llm_plan = await _llm_plan_from_natural_language(
-                message, request_text, retry_feedback
-            )
-            domain_name = str(llm_plan.get("domain_name", "")).strip()
-            problem_name = str(llm_plan.get("problem_name", "")).strip()
-            domain_update = str(llm_plan.get("domain_update", "")).strip()
-            task_update = str(llm_plan.get("task_update", "")).strip()
-            action_name = llm_plan.get("action_name")
-
-            if not domain_name or not problem_name or not domain_update or not task_update:
-                raise RuntimeError("The model did not return a complete domain/task update payload.")
-
-            try:
-                domain_payload = await _update_domain_with_fallback(
-                    domain_update=domain_update,
-                    domain_name=domain_name,
-                    action_name=action_name,
+            if not domain_text and not problem_text:
+                raise RuntimeError(
+                    "No current domain or problem to solve. Run `!domain`, `!problem`, or `!plan` first, or attach domain and problem PDDL files."
                 )
-                task_payload = await update_task_via_l2p(
-                    task_update=task_update,
-                    domain_name=domain_name,
-                    problem_name=problem_name,
+            if not domain_text:
+                raise RuntimeError(
+                    "No current domain to solve with. Run `!domain` or `!plan` first, or attach a domain PDDL file."
                 )
-            except RuntimeError as e:
-                retry_feedback = str(e)
-                continue
-
-            domain_text = _pddl_from_l2p_payload(
-                domain_payload,
-                "domain_pddl",
-                "domain",
-                "pddl",
-            )
-            problem_text = _pddl_from_l2p_payload(
-                task_payload,
-                "task_pddl",
-                "problem_pddl",
-                "problem",
-                "task",
-                "pddl",
-            )
-
-            if not domain_text or not problem_text:
-                raise RuntimeError("Failed to generate PDDL from the natural-language request.")
+            if not problem_text:
+                raise RuntimeError(
+                    "No current problem to solve with. Run `!problem` or `!plan` first, or attach a problem PDDL file."
+                )
 
             raw_result = await solve_pddl(domain_text, problem_text)
             result = _parse_solve_response_text(raw_result)
             if _planner_output_indicates_failure(result) and not _solve_output_has_action_steps(
                 result
             ):
-                retry_feedback = result
-                continue
-            break
+                raise RuntimeError(result or "Failed to produce a valid plan from the current domain and problem.")
         else:
-            raise RuntimeError(retry_feedback or "Failed to produce a valid plan.")
+            result = ""
+            retry_feedback: str | None = None
+
+            for _ in range(2):
+                llm_plan = await _llm_plan_from_natural_language(
+                    message, request_text, retry_feedback
+                )
+                domain_name = str(llm_plan.get("domain_name", "")).strip()
+                problem_name = str(llm_plan.get("problem_name", "")).strip()
+                domain_update = str(llm_plan.get("domain_update", "")).strip()
+                task_update = str(llm_plan.get("task_update", "")).strip()
+                action_name = llm_plan.get("action_name")
+
+                if not domain_name or not problem_name or not domain_update or not task_update:
+                    raise RuntimeError("The model did not return a complete domain/task update payload.")
+
+                try:
+                    domain_payload = await _update_domain_with_fallback(
+                        domain_update=domain_update,
+                        domain_name=domain_name,
+                        action_name=action_name,
+                    )
+                    task_payload = await update_task_via_l2p(
+                        task_update=task_update,
+                        domain_name=domain_name,
+                        problem_name=problem_name,
+                    )
+                except RuntimeError as e:
+                    retry_feedback = str(e)
+                    continue
+
+                domain_text = _pddl_from_l2p_payload(
+                    domain_payload,
+                    "domain_pddl",
+                    "domain",
+                    "pddl",
+                )
+                problem_text = _pddl_from_l2p_payload(
+                    task_payload,
+                    "task_pddl",
+                    "problem_pddl",
+                    "problem",
+                    "task",
+                    "pddl",
+                )
+
+                if not domain_text or not problem_text:
+                    raise RuntimeError("Failed to generate PDDL from the natural-language request.")
+
+                request_mismatch = _check_request_matches_generated_problem(
+                    request_text,
+                    problem_text,
+                )
+                if request_mismatch:
+                    retry_feedback = (
+                        "The generated problem did not faithfully match the user's request. "
+                        f"{request_mismatch}"
+                    )
+                    continue
+
+                raw_result = await solve_pddl(domain_text, problem_text)
+                result = _parse_solve_response_text(raw_result)
+                if _planner_output_indicates_failure(result) and not _solve_output_has_action_steps(
+                    result
+                ):
+                    retry_feedback = result
+                    continue
+                plan_mismatch = _check_request_matches_generated_plan(
+                    request_text,
+                    result,
+                )
+                if plan_mismatch:
+                    retry_feedback = (
+                        "The generated plan did not faithfully match the user's request. "
+                        f"{plan_mismatch}"
+                    )
+                    continue
+                break
+            else:
+                raise RuntimeError(retry_feedback or "Failed to produce a valid plan.")
 
     _store_last_solve_artifacts(
         message, domain_text, problem_text, result, domain_name, problem_name
     )
-    safe_domain_name = _safe_pddl_name(domain_name, "domain")
-    safe_problem_name = _safe_pddl_name(problem_name, "problem")
-    files = [
-        _text_file(domain_text, f"{safe_domain_name}.pddl"),
-        _text_file(problem_text, f"{safe_problem_name}.pddl"),
-        _text_file(result, "plan.txt"),
-    ]
-    return "Generated planning artifacts.", files
+    return f"Generated planning artifacts.\n\nCurrent plan:\n```text\n{result.strip()}\n```", None
 
 
 async def _run_domain_request(message: discord.Message, request_text: str) -> tuple[str, str]:
@@ -662,7 +1099,7 @@ async def _run_validate_plan_request(message: discord.Message) -> str:
         if not domain_text or not problem_text or not plan_text:
             return "Nothing to validate"
     result = await validate_plan(domain_text, problem_text, plan_text)
-    return _truncate_discord_message(result or "Plan validation returned an empty response.")
+    return _format_validation_result("plan", result or "Plan validation returned an empty response.")
 
 
 async def _run_validate_domain_request(message: discord.Message) -> str:
@@ -676,7 +1113,7 @@ async def _run_validate_domain_request(message: discord.Message) -> str:
         if not domain_text:
             return "Nothing to validate"
     result = await validate_domain(domain_text)
-    return _truncate_discord_message(result or "Domain validation returned an empty response.")
+    return _format_validation_result("domain", result or "Domain validation returned an empty response.")
 
 
 async def _run_validate_task_request(message: discord.Message) -> str:
@@ -691,7 +1128,7 @@ async def _run_validate_task_request(message: discord.Message) -> str:
         if not domain_text or not problem_text:
             return "Nothing to validate"
     result = await validate_task(domain_text, problem_text)
-    return _truncate_discord_message(result or "Task validation returned an empty response.")
+    return _format_validation_result("task", result or "Task validation returned an empty response.")
 
 
 async def _run_autovalidate_request(
@@ -849,8 +1286,39 @@ async def _run_show_artifact_request(
     if not text:
         raise RuntimeError(f"No current {artifact_type} to show.")
     reply_text = _artifact_reply_text(current, artifact_type)
-    files = [_text_file(text, _artifact_filename(current, artifact_type))]
-    return reply_text, files
+    return reply_text, None
+
+
+async def _run_explain_artifact_request(message: discord.Message, artifact_type: str) -> str:
+    current = _working_artifacts(message)
+    text = _artifact_text(current, artifact_type)
+    if not text:
+        raise RuntimeError(f"No current {artifact_type} to explain.")
+    explanation = await _llm_explain_artifact(message, artifact_type, text)
+    if not explanation:
+        raise RuntimeError(f"Failed to explain the current {artifact_type}.")
+    header = f"{artifact_type.capitalize()} explanation:"
+    return _truncate_discord_message(f"{header}\n{explanation}")
+
+
+async def _run_files_request(message: discord.Message) -> tuple[str, list[discord.File]]:
+    current = _working_artifacts(message)
+    domain_text = _artifact_text(current, "domain")
+    problem_text = _artifact_text(current, "problem")
+    plan_text = _artifact_text(current, "plan")
+
+    if not domain_text and not problem_text and not plan_text:
+        raise RuntimeError("No current domain, problem, or plan to send.")
+
+    files: list[discord.File] = []
+    if domain_text:
+        files.append(_text_file(domain_text, _artifact_filename(current, "domain")))
+    if problem_text:
+        files.append(_text_file(problem_text, _artifact_filename(current, "problem")))
+    if plan_text:
+        files.append(_text_file(plan_text, _artifact_filename(current, "plan")))
+
+    return "Current artifact files.", files
 
 
 async def _run_edit_domain_request(message: discord.Message, instruction: str) -> tuple[str, list[discord.File]]:
@@ -862,38 +1330,35 @@ async def _run_edit_domain_request(message: discord.Message, instruction: str) -
     retry_feedback: str | None = None
     domain_name = str(current.get("domain_name", "domain")).strip() or "domain"
     for _ in range(2):
-        edit = await _llm_domain_edit_from_instruction(
+        edit = await _llm_domain_pddl_edit_from_instruction(
             message,
             instruction,
             current_domain,
             domain_name,
             retry_feedback,
         )
-        try:
-            domain_payload = await _update_domain_with_fallback(
-                domain_update=str(edit.get("domain_update", "")).strip(),
-                domain_name=str(edit.get("domain_name", domain_name)).strip() or domain_name,
-                action_name=edit.get("action_name"),
-            )
-        except RuntimeError as e:
-            retry_feedback = str(e)
-            continue
-
         domain_name = str(edit.get("domain_name", domain_name)).strip() or domain_name
-        domain_text = _pddl_from_l2p_payload(domain_payload, "domain_pddl", "domain", "pddl")
+        domain_text = str(edit.get("domain_pddl", "")).strip()
         if not domain_text:
             raise RuntimeError("Failed to generate revised domain PDDL.")
+        validation_result = await validate_domain(domain_text)
+        if not _validation_indicates_valid("domain", validation_result):
+            retry_feedback = _format_validation_result("domain", validation_result)
+            continue
         current = _update_working_artifacts(message, domain=domain_text, domain_name=domain_name)
         return (
-            _format_domain_reply(domain_name, domain_text),
-            [_text_file(domain_text, _artifact_filename(current, "domain"))],
+            _format_updated_pddl_reply("domain", domain_name, domain_text),
+            None,
         )
     raise RuntimeError(retry_feedback or "Failed to revise the domain.")
 
 
 async def _run_edit_problem_request(message: discord.Message, instruction: str) -> tuple[str, list[discord.File]]:
     current = _working_artifacts(message)
+    current_domain = _artifact_text(current, "domain")
     current_problem = _artifact_text(current, "problem")
+    if not current_domain:
+        raise RuntimeError("No current domain for the problem to reference. Generate or plan something first.")
     if not current_problem:
         raise RuntimeError("No current problem to edit. Generate or plan something first.")
 
@@ -901,31 +1366,24 @@ async def _run_edit_problem_request(message: discord.Message, instruction: str) 
     domain_name = str(current.get("domain_name", "domain")).strip() or "domain"
     problem_name = str(current.get("problem_name", "problem")).strip() or "problem"
     for _ in range(2):
-        edit = await _llm_problem_edit_from_instruction(
+        edit = await _llm_problem_pddl_edit_from_instruction(
             message,
             instruction,
+            current_domain,
             current_problem,
             domain_name,
             problem_name,
             retry_feedback,
         )
-        try:
-            task_payload = await update_task_via_l2p(
-                task_update=str(edit.get("task_update", "")).strip(),
-                domain_name=str(edit.get("domain_name", domain_name)).strip() or domain_name,
-                problem_name=str(edit.get("problem_name", problem_name)).strip() or problem_name,
-            )
-        except RuntimeError as e:
-            retry_feedback = str(e)
-            continue
-
         domain_name = str(edit.get("domain_name", domain_name)).strip() or domain_name
         problem_name = str(edit.get("problem_name", problem_name)).strip() or problem_name
-        problem_text = _pddl_from_l2p_payload(
-            task_payload, "task_pddl", "problem_pddl", "problem", "task", "pddl"
-        )
+        problem_text = str(edit.get("problem_pddl", "")).strip()
         if not problem_text:
             raise RuntimeError("Failed to generate revised problem PDDL.")
+        validation_result = await validate_task(current_domain, problem_text)
+        if not _validation_indicates_valid("task", validation_result):
+            retry_feedback = _format_validation_result("task", validation_result)
+            continue
         current = _update_working_artifacts(
             message,
             problem=problem_text,
@@ -933,8 +1391,8 @@ async def _run_edit_problem_request(message: discord.Message, instruction: str) 
             domain_name=domain_name,
         )
         return (
-            _format_problem_reply(problem_name, problem_text),
-            [_text_file(problem_text, _artifact_filename(current, "problem"))],
+            _format_updated_pddl_reply("problem", problem_name, problem_text),
+            None,
         )
     raise RuntimeError(retry_feedback or "Failed to revise the problem.")
 
@@ -965,6 +1423,7 @@ async def _run_undo_request(message: discord.Message, artifact_type: str) -> tup
             restored_index = index
             current.update(snapshot)
             del history[index:]
+            _persist_artifacts_if_session_saved()
             break
     if restored_index is None:
         raise RuntimeError(f"No previous {artifact_type} version to restore.")
@@ -1432,6 +1891,11 @@ async def setkey_cmd(interaction: discord.Interaction, provider: str, api_key: s
 @bot.event
 async def on_ready():
     await connect_mcp_servers()
+    saved_artifacts, saved_history = load_saved_working_artifacts()
+    LAST_SOLVE_ARTIFACTS.clear()
+    LAST_SOLVE_ARTIFACTS.update(saved_artifacts)
+    ARTIFACT_HISTORY.clear()
+    ARTIFACT_HISTORY.update(saved_history)
     print(f"Logged in as {bot.user} (id={bot.user.id})")
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
@@ -1663,6 +2127,44 @@ async def show_cmd(ctx: commands.Context, artifact_type: str):
         await ctx.send(chunk)
 
 
+@bot.command(name="files")
+async def files_cmd(ctx: commands.Context):
+    async with ctx.typing():
+        try:
+            reply_text, files = await _run_files_request(ctx.message)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Files failed: {type(e).__name__}: {e}")
+            )
+            return
+
+    await ctx.reply(reply_text, files=files)
+
+
+@bot.command(name="explain")
+async def explain_cmd(ctx: commands.Context, artifact_type: str):
+    normalized = _normalize_artifact_type(artifact_type)
+    if normalized is None:
+        await ctx.reply("Use `!explain domain`, `!explain problem`, or `!explain plan`.")
+        return
+
+    async with ctx.typing():
+        try:
+            reply_text = await _run_explain_artifact_request(ctx.message, normalized)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.reply(
+                _truncate_discord_message(f"Explain failed: {type(e).__name__}: {e}")
+            )
+            return
+
+    messages = _split_discord_message(reply_text)
+    await ctx.reply(messages[0])
+    for chunk in messages[1:]:
+        await ctx.send(chunk)
+
+
 @bot.command(name="edit")
 async def edit_cmd(ctx: commands.Context, artifact_type: str, *, instruction: str | None = None):
     normalized = _normalize_artifact_type(artifact_type)
@@ -1856,6 +2358,11 @@ async def share(ctx: commands.Context):
 @bot.command()
 async def save(ctx: commands.Context):
     is_new_save = save_current_session()
+    save_working_artifacts_snapshot(
+        BOT_SESSION_ID,
+        LAST_SOLVE_ARTIFACTS,
+        ARTIFACT_HISTORY,
+    )
     if is_new_save:
         await ctx.reply("Saved the current bot session. Its conversation log will be kept after restart.")
         return

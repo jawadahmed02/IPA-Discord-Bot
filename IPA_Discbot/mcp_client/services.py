@@ -39,7 +39,7 @@ async def solve_pddl(domain: str, problem: str, timeout_s: int = 30) -> str:
 async def validate_domain(
     domain: str,
     timeout_s: int = 30,
-) -> str:
+) -> Any:
     result = await call_mcp_tool(
         "paas",
         PAAS_VALIDATE_DOMAIN_TOOL,
@@ -48,7 +48,7 @@ async def validate_domain(
             "timeout_s": timeout_s,
         },
     )
-    return str(result).strip()
+    return result
 
 
 async def validate_plan(
@@ -56,7 +56,7 @@ async def validate_plan(
     problem: str,
     plan: str,
     timeout_s: int = 30,
-) -> str:
+) -> Any:
     result = await call_mcp_tool(
         "paas",
         PAAS_VALIDATE_PLAN_TOOL,
@@ -67,14 +67,14 @@ async def validate_plan(
             "timeout_s": timeout_s,
         },
     )
-    return str(result).strip()
+    return result
 
 
 async def validate_task(
     domain: str,
     problem: str,
     timeout_s: int = 30,
-) -> str:
+) -> Any:
     result = await call_mcp_tool(
         "paas",
         PAAS_VALIDATE_TASK_TOOL,
@@ -84,7 +84,7 @@ async def validate_task(
             "timeout_s": timeout_s,
         },
     )
-    return str(result).strip()
+    return result
 
 
 async def validate_plan_with_val(

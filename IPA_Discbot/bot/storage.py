@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import UTC, datetime
+import json
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -158,6 +159,16 @@ def init_db():
             session_id TEXT PRIMARY KEY,
             saved_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS saved_working_artifacts (
+            channel_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            artifacts_json TEXT NOT NULL,
+            history_json TEXT NOT NULL,
+            saved_at TEXT NOT NULL,
+            PRIMARY KEY (channel_id, user_id)
+        );
     """
     )
 
@@ -215,6 +226,16 @@ def cleanup_unsaved_sessions():
 
         cur.execute(
             """
+            DELETE FROM saved_working_artifacts
+            WHERE session_id IS NOT NULL
+              AND TRIM(session_id) != ''
+              AND session_id NOT IN (SELECT session_id FROM saved_sessions)
+            """
+        )
+        deleted_artifact_rows = cur.rowcount if cur.rowcount is not None else 0
+
+        cur.execute(
+            """
             DELETE FROM saved_sessions
             WHERE session_id NOT IN (SELECT DISTINCT session_id FROM messages)
             """
@@ -225,6 +246,8 @@ def cleanup_unsaved_sessions():
 
     if deleted_rows:
         print(f"[DB] Deleted {deleted_rows} unsaved message(s) from prior bot sessions.")
+    if deleted_artifact_rows:
+        print(f"[DB] Deleted {deleted_artifact_rows} unsaved artifact snapshot(s) from prior bot sessions.")
 
 
 def save_current_session() -> bool:
@@ -248,6 +271,101 @@ def save_current_session() -> bool:
         return not already_saved
     finally:
         con.close()
+
+
+def is_session_saved(session_id: str) -> bool:
+    con = _db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT 1 FROM saved_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        return cur.fetchone() is not None
+    finally:
+        con.close()
+
+
+def save_working_artifacts_snapshot(
+    session_id: str,
+    artifacts_by_key: dict[tuple[int, int], dict[str, str]],
+    history_by_key: dict[tuple[int, int], list[dict[str, str]]],
+):
+    con = _db_connect()
+    try:
+        cur = con.cursor()
+        saved_at = datetime.now(UTC).isoformat()
+        for (channel_id, user_id), artifacts in artifacts_by_key.items():
+            artifact_payload = {str(k): str(v) for k, v in dict(artifacts).items()}
+            history_payload = [
+                {str(k): str(v) for k, v in dict(snapshot).items()}
+                for snapshot in history_by_key.get((channel_id, user_id), [])
+            ]
+            cur.execute(
+                """
+                INSERT INTO saved_working_artifacts (
+                    channel_id, user_id, session_id, artifacts_json, history_json, saved_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel_id, user_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    artifacts_json=excluded.artifacts_json,
+                    history_json=excluded.history_json,
+                    saved_at=excluded.saved_at
+                """,
+                (
+                    str(channel_id),
+                    str(user_id),
+                    session_id,
+                    json.dumps(artifact_payload),
+                    json.dumps(history_payload),
+                    saved_at,
+                ),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def load_saved_working_artifacts() -> tuple[dict[tuple[int, int], dict[str, str]], dict[tuple[int, int], list[dict[str, str]]]]:
+    con = _db_connect()
+    try:
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT channel_id, user_id, artifacts_json, history_json
+            FROM saved_working_artifacts
+            ORDER BY saved_at ASC
+            """
+        )
+        rows = cur.fetchall()
+    finally:
+        con.close()
+
+    artifacts: dict[tuple[int, int], dict[str, str]] = {}
+    history: dict[tuple[int, int], list[dict[str, str]]] = {}
+
+    for channel_id, user_id, artifacts_json, history_json in rows:
+        try:
+            artifact_payload = json.loads(artifacts_json or "{}")
+        except json.JSONDecodeError:
+            artifact_payload = {}
+        try:
+            history_payload = json.loads(history_json or "[]")
+        except json.JSONDecodeError:
+            history_payload = []
+
+        key = (int(channel_id), int(user_id))
+        artifacts[key] = {
+            str(k): str(v) for k, v in artifact_payload.items() if v is not None
+        }
+        history[key] = [
+            {str(k): str(v) for k, v in snapshot.items() if v is not None}
+            for snapshot in history_payload
+            if isinstance(snapshot, dict)
+        ]
+
+    return artifacts, history
 
 
 def get_recent_context(
