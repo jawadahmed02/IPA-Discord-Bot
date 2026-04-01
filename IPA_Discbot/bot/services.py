@@ -200,7 +200,7 @@ def _format_help_message() -> str:
         "`!files` Send the current stored domain, problem, and plan as files.",
         "`!explain <domain|problem|plan>` Explain the current working artifact in normal language.",
         "`!edit <domain|problem|plan> <instruction>` Revise one current artifact while preserving the rest of the workflow state.",
-        "`!undo <domain|problem|plan>` Restore the previous version of one artifact.",
+        "`!undo <domain|problem>` Restore the previous version of one user-authored artifact.",
         "",
         "Validation:",
         "`!validate` Validate a plan against a domain and problem with VAL, using attachments or the last successful `!plan` output.",
@@ -1160,7 +1160,7 @@ def _detect_artifact_request(text: str) -> tuple[str, str, str] | None:
         artifact_type = show_match.group(3)
         return ("show", artifact_type, "")
 
-    undo_match = re.match(r"^(undo|revert|restore)\s+(the\s+)?(domain|problem|plan)\b", lowered)
+    undo_match = re.match(r"^(undo|revert|restore)\s+(the\s+)?(domain|problem)\b", lowered)
     if undo_match:
         artifact_type = undo_match.group(3)
         return ("undo", artifact_type, "")
@@ -2109,8 +2109,8 @@ async def edit_cmd(ctx: commands.Context, artifact_type: str, *, instruction: st
 @bot.command(name="undo")
 async def undo_cmd(ctx: commands.Context, artifact_type: str):
     normalized = _normalize_artifact_type(artifact_type)
-    if normalized is None:
-        await ctx.reply("Use `!undo domain`, `!undo problem`, or `!undo plan`.")
+    if normalized not in {"domain", "problem"}:
+        await ctx.reply("Use `!undo domain` or `!undo problem`.")
         return
 
     async with ctx.typing():
