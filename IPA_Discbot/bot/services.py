@@ -288,126 +288,6 @@ def _planner_output_indicates_failure(text: str) -> bool:
     return any(marker in lowered for marker in failure_markers)
 
 
-def _parse_requested_grid_shape(request_text: str) -> tuple[int, int] | None:
-    text = (request_text or "").lower()
-    match = re.search(r"\b(\d+)\s*x\s*(\d+)\s+grid\b", text)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-
-    match = re.search(r"\b(\d+)\s+by\s+(\d+)\s+grid\b", text)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-
-    return None
-
-
-def _request_mentions_top_left_start(request_text: str) -> bool:
-    text = (request_text or "").lower()
-    return "top left" in text and ("start" in text or "starting" in text or "begin" in text)
-
-
-def _request_mentions_bottom_right_goal(request_text: str) -> bool:
-    text = (request_text or "").lower()
-    return "bottom right" in text
-
-
-def _problem_contains_cell(problem_text: str, row: int, col: int) -> bool:
-    return re.search(rf"\bcell_{row}_{col}\b", problem_text) is not None
-
-
-def _problem_sets_start_cell(problem_text: str, row: int, col: int) -> bool:
-    return re.search(rf"\(at\s+cell_{row}_{col}\)", problem_text) is not None
-
-
-def _problem_sets_goal_cell(problem_text: str, row: int, col: int) -> bool:
-    goal_match = re.search(r"\(:goal\b(.*?)\)\s*\)\s*$", problem_text, re.IGNORECASE | re.DOTALL)
-    if goal_match is None:
-        goal_match = re.search(r"\(:goal\b(.*)", problem_text, re.IGNORECASE | re.DOTALL)
-    goal_block = goal_match.group(1) if goal_match else problem_text
-    return re.search(rf"\(at\s+cell_{row}_{col}\)", goal_block) is not None
-
-
-def _problem_uses_out_of_bounds_cell(problem_text: str, rows: int, cols: int) -> bool:
-    for row_text, col_text in re.findall(r"\bcell_(\d+)_(\d+)\b", problem_text):
-        row = int(row_text)
-        col = int(col_text)
-        if row >= rows or col >= cols:
-            return True
-    return False
-
-
-def _check_request_matches_generated_problem(request_text: str, problem_text: str) -> str | None:
-    grid_shape = _parse_requested_grid_shape(request_text)
-    if grid_shape is not None:
-        rows, cols = grid_shape
-        max_row = rows - 1
-        max_col = cols - 1
-        if not _problem_contains_cell(problem_text, max_row, max_col):
-            return (
-                f"The request asked for a {rows}x{cols} grid, so the generated problem must include "
-                f"`cell_{max_row}_{max_col}`. It does not."
-            )
-        if _problem_uses_out_of_bounds_cell(problem_text, rows, cols):
-            return "The generated problem uses cell indices outside the requested grid size."
-        if _request_mentions_top_left_start(request_text) and not _problem_sets_start_cell(problem_text, 0, 0):
-            return "The request starts at the top-left corner, so the initial state must place the agent at `cell_0_0`."
-        if _request_mentions_bottom_right_goal(request_text) and not _problem_sets_goal_cell(problem_text, max_row, max_col):
-            return (
-                f"The request targets the bottom-right corner of a {rows}x{cols} grid, "
-                f"so the goal must be `cell_{max_row}_{max_col}`."
-            )
-    return None
-
-
-def _extract_plan_steps(plan_text: str) -> list[list[str]]:
-    steps: list[list[str]] = []
-    for raw_line in plan_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith(";"):
-            continue
-        if not (line.startswith("(") and line.endswith(")")):
-            continue
-        tokens = line[1:-1].split()
-        if tokens:
-            steps.append(tokens)
-    return steps
-
-
-def _check_request_matches_generated_plan(request_text: str, plan_text: str) -> str | None:
-    grid_shape = _parse_requested_grid_shape(request_text)
-    if grid_shape is None:
-        return None
-
-    rows, cols = grid_shape
-    max_row = rows - 1
-    max_col = cols - 1
-    steps = _extract_plan_steps(plan_text)
-    if not steps:
-        return "The generated plan did not contain any recognizable action steps."
-
-    if _request_mentions_top_left_start(request_text):
-        first_args = steps[0][1:]
-        if not first_args or first_args[0] != "cell_0_0":
-            return "The request starts at the top-left corner, so the plan must start from `cell_0_0`."
-
-    if _request_mentions_bottom_right_goal(request_text):
-        last_args = steps[-1][1:]
-        if len(last_args) < 2 or last_args[1] != f"cell_{max_row}_{max_col}":
-            return (
-                f"The request targets the bottom-right corner of a {rows}x{cols} grid, "
-                f"so the final move must end at `cell_{max_row}_{max_col}`."
-            )
-
-    minimum_steps = (rows - 1) + (cols - 1)
-    if len(steps) < minimum_steps:
-        return (
-            f"A top-left to bottom-right path on a {rows}x{cols} grid cannot be shorter than "
-            f"{minimum_steps} moves, but the generated plan has only {len(steps)}."
-        )
-
-    return None
-
-
 async def _read_text_attachment(attachment: discord.Attachment) -> str:
     data = await attachment.read()
     try:
@@ -963,33 +843,12 @@ async def _run_plan_request(
                 if not domain_text or not problem_text:
                     raise RuntimeError("Failed to generate PDDL from the natural-language request.")
 
-                request_mismatch = _check_request_matches_generated_problem(
-                    request_text,
-                    problem_text,
-                )
-                if request_mismatch:
-                    retry_feedback = (
-                        "The generated problem did not faithfully match the user's request. "
-                        f"{request_mismatch}"
-                    )
-                    continue
-
                 raw_result = await solve_pddl(domain_text, problem_text)
                 result = _parse_solve_response_text(raw_result)
                 if _planner_output_indicates_failure(result) and not _solve_output_has_action_steps(
                     result
                 ):
                     retry_feedback = result
-                    continue
-                plan_mismatch = _check_request_matches_generated_plan(
-                    request_text,
-                    result,
-                )
-                if plan_mismatch:
-                    retry_feedback = (
-                        "The generated plan did not faithfully match the user's request. "
-                        f"{plan_mismatch}"
-                    )
                     continue
                 break
             else:
