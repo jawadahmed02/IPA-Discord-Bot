@@ -509,6 +509,10 @@ def _val_output_indicates_valid(text: str) -> bool:
     lowered = (text or "").strip().lower()
     if not lowered:
         return False
+    type_check_failure_patterns = (
+        r"type-?checking[^\n]*(?:error|failed|failure|invalid)",
+        r"type checking[^\n]*(?:error|failed|failure|invalid)",
+    )
     positive_markers = (
         "plan valid",
         "plan executed successfully",
@@ -520,7 +524,6 @@ def _val_output_indicates_valid(text: str) -> bool:
     negative_markers = (
         "error:",
         "unknown type",
-        "type-checking",
         "goal not satisfied",
         "unsatisfied",
         "invalid",
@@ -533,6 +536,8 @@ def _val_output_indicates_valid(text: str) -> bool:
         "violat",
     )
     if any(marker in lowered for marker in negative_markers):
+        return False
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in type_check_failure_patterns):
         return False
     return any(marker in lowered for marker in positive_markers)
 
@@ -606,6 +611,10 @@ def _summarize_validation_failure(details: str) -> str:
     if not text:
         return ""
 
+    type_check_failure_patterns = (
+        r"type-?checking[^\n]*(?:error|failed|failure|invalid)[^\n]*",
+        r"type checking[^\n]*(?:error|failed|failure|invalid)[^\n]*",
+    )
     precondition_failure_patterns = (
         r"precondition[^\n]*not satisfied[^\n]*",
         r"precondition[^\n]*is false[^\n]*",
@@ -617,7 +626,7 @@ def _summarize_validation_failure(details: str) -> str:
         r"[A-Za-z0-9_.]*Error:\s*[^\n]+",
         r"problem in (?:domain|problem|plan) definition[^\n]*",
         r"unknown type[^\n]*",
-        r"type-?checking[^\n]*",
+        *type_check_failure_patterns,
         r"goal not satisfied[^\n]*",
         r"cannot be applied[^\n]*",
         *precondition_failure_patterns,
@@ -657,10 +666,13 @@ def _validation_indicates_valid(kind: str, raw: object) -> bool:
     text = _collect_validation_text(payload) or str(raw or "")
     lowered = text.lower()
 
+    type_check_failure_patterns = (
+        r"type-?checking[^\n]*(?:error|failed|failure|invalid)",
+        r"type checking[^\n]*(?:error|failed|failure|invalid)",
+    )
     common_negative_markers = (
         "error:",
         "unknown type",
-        "type-checking",
         "invalid",
         "failed",
         "problem in domain definition",
@@ -684,6 +696,8 @@ def _validation_indicates_valid(kind: str, raw: object) -> bool:
 
     negative_markers = common_negative_markers + (plan_negative_markers if kind == "plan" else ())
     if any(marker in lowered for marker in negative_markers):
+        return False
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in type_check_failure_patterns):
         return False
     if kind == "plan" and any(re.search(pattern, text, re.IGNORECASE) for pattern in plan_negative_patterns):
         return False
