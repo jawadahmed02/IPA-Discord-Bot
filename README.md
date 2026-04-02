@@ -1,3 +1,6 @@
+# Demonstration
+<div style="position: relative; padding-bottom: 49.36014625228518%; height: 0;"><iframe src="https://www.loom.com/embed/7c9f8f98e8f44776b55249da51d1f004" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></iframe></div>
+
 # IPA_Discbot
 
 `IPA_Discbot` is a Discord-based interactive planning assistant. It combines a conversational bot, persistent user context, model selection through the `llm` Python package, and MCP-backed planning services so users can move between natural-language requests and planning tools inside Discord.
