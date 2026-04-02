@@ -36,6 +36,7 @@ This package contains the Discord bot itself. It is responsible for loading runt
 - Supports `!tools` and `!paastools` to inspect MCP tool availability
 - Supports private chat-thread creation with `!thread`
 - Supports per-channel chat toggling with `!chat`
+- Supports shared collaborative channel mode with `!collab`
 - Supports provider-key sharing with `!share` and session persistence with `!save`
 - Syncs slash commands into the configured guild from `GUILD_ID`
 
