@@ -1,5 +1,5 @@
 # Demonstration
-<div style="position: relative; padding-bottom: 49.36014625228518%; height: 0;"><iframe src="https://www.loom.com/embed/7c9f8f98e8f44776b55249da51d1f004" frameborder="0" webkitallowfullscreen mozallowfullscreen allowfullscreen style="position: absolute; top: 0; left: 0; width: 100%; height: 100%;"></iframe></div>
+[![User demo video](https://cdn.loom.com/sessions/thumbnails/7c9f8f98e8f44776b55249da51d1f004-64bc52969c2346b5-full-play.gif#t=0.1)](https://www.loom.com/share/7c9f8f98e8f44776b55249da51d1f004)
 
 # IPA_Discbot
 
