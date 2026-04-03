@@ -59,13 +59,12 @@ Before running the bot, you also need the `l2p-mcp` service running as a Docker 
 
 - `l2p-mcp`: https://github.com/adam-neto/l2p_mcp
 
-Set up a `.env` file with at least:
+Set up a `.env` file. You can start from `.env.example`.
+
+Required values:
 
 - `DISCORD_TOKEN`
 - `BOT_MASTER_KEY`
-- `PAAS_MCP_URL`
-- `L2P_MCP_URL`
-- `DISCORD_GUILD_ID` if you want to override the current default guild used for slash-command sync
 
 Optional provider keys:
 
@@ -73,10 +72,16 @@ Optional provider keys:
 - `LLM_GEMINI_KEY`
 - `ANTHROPIC_API_KEY`
 
-Optional model override:
+Optional runtime settings:
 
 - `OPENAI_MODEL` defaults to `gpt-4.1`
 - `DB_PATH` defaults to `bot.db`
+- `DISCORD_GUILD_ID` if you want to override the current default guild used for slash-command sync
+
+Optional MCP endpoint overrides for running the bot directly on your host:
+
+- `PAAS_MCP_URL` defaults to `https://solver.planning.domains/mcp`
+- `L2P_MCP_URL` defaults to `http://127.0.0.1:8002/mcp`
 
 ## MCP Layer
 
@@ -115,6 +120,8 @@ The container setup is configured to:
 - run the Discord bot as a background service
 - restart automatically unless you stop it explicitly
 - persist the SQLite database in a Docker volume
+- load runtime secrets and overrides from `.env`
+- set image-level defaults for `OPENAI_MODEL`, `DISCORD_GUILD_ID`, `DB_PATH`, `PAAS_MCP_URL`, and `L2P_MCP_URL`
 - default `DB_PATH` to `/data/bot.db`
 - default `PAAS_MCP_URL` to `https://solver.planning.domains/mcp`
 - default `L2P_MCP_URL` to `http://host.docker.internal:8002/mcp` so the bot container can reach a separately running `l2p-mcp` service on the host
