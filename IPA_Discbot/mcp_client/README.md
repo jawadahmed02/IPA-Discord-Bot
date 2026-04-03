@@ -1,6 +1,6 @@
 # MCP Client Package
 
-This package contains the bot's MCP integration layer. Its job is to keep live connections to the configured MCP servers, call their tools, normalize their responses, and expose simple planning helpers to the rest of the bot.
+This package contains the bot's MCP integration layer. Its job is to reach the configured MCP servers, call their tools, normalize their responses, and expose simple planning helpers to the rest of the bot.
 
 ## Files
 
@@ -30,13 +30,13 @@ Current defaults:
 
 ## Connection Model
 
-The package keeps one live MCP connection per backend during bot runtime. Those sessions are opened on bot startup and closed on shutdown.
+The package keeps one shared MCP connection object per backend during bot runtime. Connections are established lazily on first use and then reused across later requests until shutdown.
 
 This means:
 
-- solve requests do not need to reconnect every time
-- tool listing can query both backends directly
-- the bot has a single shared MCP manager for the process
+- the bot does not need to connect to every backend at startup
+- solve and validation requests reuse the same backend session once connected
+- tool listing and edit helpers can share the same per-backend connection state
 
 ## Public Operations
 

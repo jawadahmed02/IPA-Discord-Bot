@@ -7,7 +7,9 @@ This package contains the Discord bot itself. It is responsible for loading runt
 - `config.py`: shared runtime configuration, environment loading, Discord intents, and the global bot instance
 - `storage.py`: SQLite access, encrypted provider key storage, message logging, and per-user model persistence
 - `llm_helpers.py`: LLM prompting helpers plus lightweight classification helpers used for conversational routing
-- `services.py`: Discord commands, slash commands, event handlers, message parsing, and message-to-action routing
+- `parsing.py`: Discord-facing parsing helpers for attachments, validation payloads, artifact requests, and message formatting
+- `state.py`: in-memory planning artifact state, artifact history, and shared-vs-personal workspace coordination
+- `services.py`: Discord commands, slash commands, event handlers, and workflow orchestration
 - `__init__.py`: package entrypoint exposing `bot` and `run()`
 - `__main__.py`: allows the package to be executed as a module
 
@@ -17,7 +19,7 @@ This package contains the Discord bot itself. It is responsible for loading runt
 2. The database is initialized through `storage.py`.
 3. The Discord bot created in `config.py` starts running.
 4. Importing `services.py` registers the bot commands and event handlers.
-5. On startup, the bot connects to both MCP backends.
+5. Planning workflows call into `IPA_Discbot.mcp_client` when they need solve, validation, or editing operations.
 6. Messages are routed into one of four main paths:
    - direct command handling
    - member or thread helper actions
@@ -53,6 +55,9 @@ Before starting the bot, make sure your environment is set up with:
 - `DISCORD_TOKEN`
 - `BOT_MASTER_KEY`
 - `DISCORD_GUILD_ID`
+
+Planning features also expect the MCP endpoints to be reachable:
+
 - `PAAS_MCP_URL`
 - `L2P_MCP_URL`
 

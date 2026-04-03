@@ -18,23 +18,16 @@ At runtime, the flow is:
 
 1. The Discord bot starts from `IPA_Discbot.bot`.
 2. Environment configuration is loaded and the bot instance is created.
-3. On startup, the bot opens live MCP connections to both configured backends.
+3. Discord messages are classified into chat, workflow, helper, or command paths.
 4. Discord messages are routed either into command handlers, planning helpers, member/thread actions, or normal LLM chat.
 5. Conversation history and per-user model/provider settings are stored in SQLite.
 6. Planning requests are sent through the MCP client layer, and results are returned back into Discord.
 
 ## Bot Layer
 
-The `bot/` package is split by responsibility:
+The `bot/` package is the user-facing layer. It handles Discord interaction, conversation state, user settings, and the planning workflow that users see in chat.
 
-- `config.py` defines shared runtime configuration and the bot instance.
-- `storage.py` handles SQLite persistence, encrypted provider keys, and message history.
-- `llm_helpers.py` wraps model prompting and lightweight LLM classification helpers.
-- `services.py` contains Discord commands, event handlers, and message-routing behavior.
-- `__init__.py` exposes the package entrypoint via `run()`.
-- `__main__.py` makes the package runnable with `python3 -m IPA_Discbot.bot`.
-
-The bot currently supports:
+Its main capabilities are:
 
 - normal conversational replies with persisted context
 - per-user model selection
@@ -47,6 +40,8 @@ The bot currently supports:
 - thread creation, member lookup, and thread-add helper flows
 - session saving and provider-key sharing controls
 - MCP tool listing across both configured servers with `!tools` and `!paastools`
+
+In practice, this layer interprets Discord messages, decides when to call the planning services, tracks the current working domain/problem/plan for a user or shared channel, and formats results back into Discord replies and files.
 
 ## Setup
 
@@ -86,19 +81,19 @@ Optional MCP endpoint overrides for running the bot directly on your host:
 
 ## MCP Layer
 
-The `mcp_client/` package is the interface between the bot and the planning services. It keeps one live connection to each supported backend and exposes simple helpers that the bot can call.
+The `mcp_client/` package is the planning-service adapter for the bot. It hides MCP transport details, knows how to reach the configured planning backends, and turns backend responses into simpler values the bot can use.
 
-The MCP package is split into:
-
-- `config.py` for backend names, tool names, and endpoint resolution
-- `manager.py` for persistent MCP session lifecycle
-- `parsing.py` for normalizing MCP responses
-- `services.py` for higher-level bot-facing MCP operations
-
-The current backends are:
+The current MCP-based backends are:
 
 - `paas` for planning solve requests
 - `l2p` for local planning-editing tools
+
+Its main responsibilities are:
+
+- call solver and validation tools on the remote planning backends
+- expose higher-level operations like solve, validate, and planning-edit helpers
+- normalize planner and validation payloads before they reach the bot layer
+- keep backend-specific tool names and endpoint resolution in one place
 
 ## Running The Bot
 
@@ -110,7 +105,7 @@ Start the bot from the repo root with:
 python3 -m IPA_Discbot.bot
 ```
 
-Startup initializes the database, loads environment variables, constructs the Discord bot, registers handlers, and connects to both MCP servers before serving requests.
+Startup initializes the database, loads environment variables, constructs the Discord bot, and registers handlers before serving requests. Planning features connect to the MCP backends when they need them.
 
 ## Docker
 
@@ -122,10 +117,9 @@ The container setup is configured to:
 - restart automatically unless you stop it explicitly
 - persist the SQLite database in a Docker volume
 - load runtime secrets and overrides from `.env`
-- set image-level defaults for `OPENAI_MODEL`, `DB_PATH`, `PAAS_MCP_URL`, and `L2P_MCP_URL`
 - default `DB_PATH` to `/data/bot.db`
-- default `PAAS_MCP_URL` to `https://solver.planning.domains/mcp`
-- default `L2P_MCP_URL` to `http://host.docker.internal:8002/mcp` so the bot container can reach a separately running `l2p-mcp` service on the host
+- set `PAAS_MCP_URL` to `https://solver.planning.domains/mcp`
+- set `L2P_MCP_URL` to `http://host.docker.internal:8002/mcp` so the bot container can reach a separately running `l2p-mcp` service on the host
 
 Once the required MCP backends are reachable, start the bot from the repo root with:
 
