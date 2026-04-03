@@ -1,7 +1,6 @@
 FROM python:3.14-slim
 
 ENV OPENAI_MODEL=gpt-4.1
-ENV DISCORD_GUILD_ID=1376609949114699886
 ENV DB_PATH=/data/bot.db
 ENV PAAS_MCP_URL=https://solver.planning.domains/mcp
 ENV L2P_MCP_URL=http://host.docker.internal:8002/mcp

@@ -51,6 +51,7 @@ Before starting the bot, make sure your environment is set up with:
 
 - `DISCORD_TOKEN`
 - `BOT_MASTER_KEY`
+- `DISCORD_GUILD_ID`
 - `PAAS_MCP_URL`
 - `L2P_MCP_URL`
 

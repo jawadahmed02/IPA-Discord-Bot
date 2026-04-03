@@ -65,6 +65,7 @@ Required values:
 
 - `DISCORD_TOKEN`
 - `BOT_MASTER_KEY`
+- `DISCORD_GUILD_ID`
 
 Optional provider keys:
 
@@ -76,7 +77,6 @@ Optional runtime settings:
 
 - `OPENAI_MODEL` defaults to `gpt-4.1`
 - `DB_PATH` defaults to `bot.db`
-- `DISCORD_GUILD_ID` if you want to override the current default guild used for slash-command sync
 
 Optional MCP endpoint overrides for running the bot directly on your host:
 
@@ -121,7 +121,7 @@ The container setup is configured to:
 - restart automatically unless you stop it explicitly
 - persist the SQLite database in a Docker volume
 - load runtime secrets and overrides from `.env`
-- set image-level defaults for `OPENAI_MODEL`, `DISCORD_GUILD_ID`, `DB_PATH`, `PAAS_MCP_URL`, and `L2P_MCP_URL`
+- set image-level defaults for `OPENAI_MODEL`, `DB_PATH`, `PAAS_MCP_URL`, and `L2P_MCP_URL`
 - default `DB_PATH` to `/data/bot.db`
 - default `PAAS_MCP_URL` to `https://solver.planning.domains/mcp`
 - default `L2P_MCP_URL` to `http://host.docker.internal:8002/mcp` so the bot container can reach a separately running `l2p-mcp` service on the host
