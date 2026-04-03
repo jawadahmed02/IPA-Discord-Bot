@@ -11,6 +11,7 @@ The repo is organized around two main internal packages:
 
 - `IPA_Discbot/bot/` contains the Discord bot runtime, command handlers, conversation flow, and persistence logic.
 - `IPA_Discbot/mcp_client/` contains the MCP integration layer that talks to the planning backends.
+- `config/config.yaml` contains sample provider and model configuration for local tooling.
 
 ## High-Level Architecture
 
@@ -48,7 +49,7 @@ In practice, this layer interprets Discord messages, decides when to call the pl
 Install dependencies from the repo root with:
 
 ```bash
-python3 -m pip install -r IPA_Discbot/requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 Before running the bot, you also need the `l2p-mcp` service running as a Docker service. The bot depends on that MCP backend for planning-edit flows and related `l2p` tooling:

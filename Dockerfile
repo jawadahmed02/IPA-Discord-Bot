@@ -5,7 +5,7 @@ ENV DB_PATH=/data/bot.db
 
 WORKDIR /app
 
-COPY IPA_Discbot/requirements.txt /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements.txt
 
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
