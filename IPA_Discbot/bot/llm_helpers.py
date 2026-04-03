@@ -186,11 +186,6 @@ def _plan_to_natural_language(plan_text: str) -> str:
     return "Natural-language steps:\n" + "\n".join(steps)
 
 
-def _format_solve_reply(plan_text: str) -> str:
-    readable = _plan_to_natural_language(plan_text)
-    return f"{readable}\n\nRaw plan:\n```text\n{plan_text.strip()}\n```"
-
-
 def _to_pddl_identifier(value: str, default: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", (value or "").strip().lower())
     cleaned = re.sub(r"_+", "_", cleaned).strip("_-")

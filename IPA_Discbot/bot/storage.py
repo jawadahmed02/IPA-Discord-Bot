@@ -278,19 +278,6 @@ def save_current_session() -> bool:
         con.close()
 
 
-def is_session_saved(session_id: str) -> bool:
-    con = _db_connect()
-    try:
-        cur = con.cursor()
-        cur.execute(
-            "SELECT 1 FROM saved_sessions WHERE session_id = ?",
-            (session_id,),
-        )
-        return cur.fetchone() is not None
-    finally:
-        con.close()
-
-
 def save_working_artifacts_snapshot(
     session_id: str,
     artifacts_by_key: dict[tuple[int, int], dict[str, str]],
