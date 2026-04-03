@@ -65,6 +65,7 @@ Set up a `.env` file with at least:
 - `BOT_MASTER_KEY`
 - `PAAS_MCP_URL`
 - `L2P_MCP_URL`
+- `DISCORD_GUILD_ID` if you want to override the current default guild used for slash-command sync
 
 Optional provider keys:
 
@@ -75,6 +76,7 @@ Optional provider keys:
 Optional model override:
 
 - `OPENAI_MODEL` defaults to `gpt-4.1`
+- `DB_PATH` defaults to `bot.db`
 
 ## MCP Layer
 
@@ -103,3 +105,31 @@ python3 -m IPA_Discbot.bot
 ```
 
 Startup initializes the database, loads environment variables, constructs the Discord bot, registers handlers, and connects to both MCP servers before serving requests.
+
+## Docker
+
+This repo includes a small `Dockerfile` and `docker-compose.yml` for running the Discord bot as a long-lived service.
+
+The container setup is configured to:
+
+- run the Discord bot as a background service
+- restart automatically unless you stop it explicitly
+- persist the SQLite database in a Docker volume
+- default `DB_PATH` to `/data/bot.db`
+- default `PAAS_MCP_URL` to `https://solver.planning.domains/mcp`
+- default `L2P_MCP_URL` to `http://host.docker.internal:8002/mcp` so the bot container can reach a separately running `l2p-mcp` service on the host
+
+Once the required MCP backends are reachable, start the bot from the repo root with:
+
+```bash
+docker compose up -d --build
+```
+
+Helpful commands:
+
+- `docker compose logs -f`
+- `docker compose ps`
+- `docker compose restart`
+- `docker compose down`
+
+By default, bot data is stored in the named Docker volume `ipa-discbot-data`. If you prefer a host-mounted database path instead, update `DB_PATH` and the Compose volume mapping together.
