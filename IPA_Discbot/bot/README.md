@@ -34,7 +34,7 @@ This package contains the Discord bot itself. It is responsible for loading runt
 - Accepts planning requests through `!plan` with either PDDL attachments or a natural-language request
 - Supports `!domain` and `!problem` to generate artifacts directly from natural language
 - Supports `!show`, `!edit`, and `!undo` for human-in-the-loop artifact revision
-- Supports `!validate`, `!validate_domain`, `!validate_task`, and `!autovalidate`
+- Supports `!validate`, `!validate_domain`, `!validate_task`, `!validate_plan`, and `!autovalidate` (in beta)
 - Supports `!tools` and `!paastools` to inspect MCP tool availability
 - Supports private chat-thread creation with `!thread`
 - Supports per-channel chat toggling with `!chat`
@@ -64,6 +64,8 @@ Planning features also expect the MCP endpoints to be reachable:
 If you want to use a provider-backed model for conversation or natural-language solve, save the corresponding provider key through `/setkey`. User keys are stored encrypted in SQLite.
 
 The default model ID comes from `OPENAI_MODEL` and falls back to `gpt-4.1`.
+
+The bot discovers provider-specific model IDs from the installed `llm` plugins, while provider keys themselves are supplied per user through `/setkey`.
 
 ## Notes
 

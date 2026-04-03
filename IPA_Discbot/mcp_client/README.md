@@ -38,6 +38,8 @@ This means:
 - solve and validation requests reuse the same backend session once connected
 - tool listing and edit helpers can share the same per-backend connection state
 
+The explicit `connect_mcp_servers()` and `verify_*()` helpers are available for tests and manual debugging, even though the bot runtime doesn't use them.
+
 ## Public Operations
 
 The main helpers exposed to the rest of the repo are:

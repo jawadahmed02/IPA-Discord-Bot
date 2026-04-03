@@ -7,11 +7,11 @@
 
 ## Repository Layout
 
-The repo is organized around two main internal packages:
+The repo is organized around two main internal packages plus a small set of top-level project files:
 
 - `IPA_Discbot/bot/` contains the Discord bot runtime, command handlers, conversation flow, and persistence logic.
 - `IPA_Discbot/mcp_client/` contains the MCP integration layer that talks to the planning backends.
-- `config/config.yaml` contains sample provider and model configuration for local tooling.
+- `requirements.txt`, `Dockerfile`, and `docker-compose.yml` hold installation and deployment setup.
 
 ## High-Level Architecture
 
@@ -37,7 +37,8 @@ Its main capabilities are:
 - natural-language `!plan`, `!domain`, and `!problem` flows that go through the local `l2p` MCP server before solving
 - artifact inspection and revision with `!show`, `!edit`, and `!undo`
 - shared channel collaboration with `!collab` for shared chat context and shared planning artifacts
-- plan, domain, task, and VAL-based validation flows with `!validate`, `!validate_domain`, `!validate_task`, and `!autovalidate`
+- PDDL syntax checking with `!validate_domain`, `!validate_task`, and `!validate_plan`
+- Validate fit between a domain/problem pair and a plan with `!validate`
 - thread creation, member lookup, and thread-add helper flows
 - session saving and provider-key sharing controls
 - MCP tool listing across both configured servers with `!tools` and `!paastools`
