@@ -55,6 +55,10 @@ Install dependencies from the repo root with:
 python3 -m pip install -r IPA_Discbot/requirements.txt
 ```
 
+Before running the bot, you also need the `l2p-mcp` service running as a Docker service. The bot depends on that MCP backend for planning-edit flows and related `l2p` tooling:
+
+- `l2p-mcp`: https://github.com/adam-neto/l2p_mcp
+
 Set up a `.env` file with at least:
 
 - `DISCORD_TOKEN`
@@ -89,6 +93,8 @@ The current backends are:
 - `l2p` for local planning-editing tools
 
 ## Running The Bot
+
+Make sure the `l2p-mcp` Docker service is already running and reachable at the `L2P_MCP_URL` you configured before starting the bot.
 
 Start the bot from the repo root with:
 
