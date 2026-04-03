@@ -1,0 +1,15 @@
+services:
+  ipa-discbot:
+    image: ipa-discbot
+    build: .
+    container_name: ipa-discbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ipa-discbot-data:/data
+
+volumes:
+  ipa-discbot-data:

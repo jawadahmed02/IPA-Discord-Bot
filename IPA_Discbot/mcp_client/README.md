@@ -15,9 +15,13 @@ This package contains the bot's MCP integration layer. Its job is to keep live c
 The client currently supports two MCP servers:
 
 - `paas`: the planning-as-a-service backend used for solve requests
-- `l2p`: the local `l2p-mcp-server` backend used for planning-edit helpers
+- `l2p`: the local `l2p-mcp` backend used for planning-edit helpers
 
 Each backend resolves its URL from environment variables first, with a built-in fallback default.
+
+For the `l2p` backend to work properly, the `l2p-mcp` service must be running separately as a Docker service. Repository:
+
+- https://github.com/adam-neto/l2p_mcp
 
 Current defaults:
 
