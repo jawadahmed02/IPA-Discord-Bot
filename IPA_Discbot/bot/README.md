@@ -61,7 +61,7 @@ Planning features also expect the MCP endpoints to be reachable:
 - `PAAS_MCP_URL`
 - `L2P_MCP_URL`
 
-If you want to use a provider-backed model for conversation or natural-language solve, also set the corresponding provider key such as `OPENAI_API_KEY`, `LLM_GEMINI_KEY`, or `ANTHROPIC_API_KEY`.
+If you want to use a provider-backed model for conversation or natural-language solve, save the corresponding provider key through `/setkey`. User keys are stored encrypted in SQLite.
 
 The default model ID comes from `OPENAI_MODEL` and falls back to `gpt-4.1`.
 

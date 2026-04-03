@@ -64,16 +64,12 @@ Required values:
 - `BOT_MASTER_KEY`
 - `DISCORD_GUILD_ID`
 
-Optional provider keys:
-
-- `OPENAI_API_KEY`
-- `LLM_GEMINI_KEY`
-- `ANTHROPIC_API_KEY`
-
 Optional runtime settings:
 
 - `OPENAI_MODEL` defaults to `gpt-4.1`
 - `DB_PATH` defaults to `bot.db`
+
+Provider API keys are supplied in Discord with `/setkey` and stored encrypted in SQLite, rather than being loaded from `.env`.
 
 Optional MCP endpoint overrides for running the bot directly on your host:
 

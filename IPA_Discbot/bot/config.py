@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BOT_MASTER_KEY = os.getenv("BOT_MASTER_KEY")
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
