@@ -6,6 +6,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      PAAS_MCP_URL: https://solver.planning.domains/mcp
+      L2P_MCP_URL: http://host.docker.internal:8002/mcp
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
