@@ -12,7 +12,6 @@ from discord.ext import commands
 
 from IPA_Discbot.mcp_client import (
     close_mcp_servers,
-    connect_mcp_servers,
     list_all_mcp_tools,
     get_mcp_tool_catalog,
     solve_pddl,
@@ -52,17 +51,21 @@ from .storage import (
     get_share_mode,
     get_recent_context,
     get_user_model,
+    is_collab_enabled,
     is_chat_enabled,
     load_saved_working_artifacts,
     log_message,
     save_current_session,
     save_working_artifacts_snapshot,
     save_provider_key,
+    set_collab_enabled,
     set_chat_enabled,
     set_share_mode,
     set_user_model,
     user_has_any_provider_key,
 )
+
+SHARED_ARTIFACT_OWNER_ID = 0
 
 
 def _truncate_discord_message(text: str, limit: int = 1900) -> str:
@@ -195,7 +198,7 @@ def _format_help_message() -> str:
         "`!problem <request>` Generate a planning problem from a natural-language request and return the problem PDDL.",
         "",
         "HITL Editing:",
-        "`!show <domain|problem|plan>` Show the current working artifact and return it as a file.",
+        "`!show <domain|problem|plan>` Show the current working artifact in chat.",
         "`!files` Send the current stored domain, problem, and plan as files.",
         "`!explain <domain|problem|plan>` Explain the current working artifact in normal language.",
         "`!edit <domain|problem|plan> <instruction>` Revise one current artifact while preserving the rest of the workflow state.",
@@ -217,6 +220,7 @@ def _format_help_message() -> str:
         "Chat and Threads:",
         "`!thread [topic]` Create a private thread in the current server channel for chatting with the bot.",
         "`!chat` Toggle normal-message bot chat on or off for you in the current channel.",
+        "`!collab` Toggle shared collaboration mode for this channel or thread.",
         "",
         "Bot Settings:",
         "`!share` Toggle whether other users may use your saved provider key when they do not have one.",
@@ -410,6 +414,8 @@ async def _extract_domain_attachment(message: discord.Message) -> str:
 
 
 def _solve_artifacts_key(message: discord.Message) -> tuple[int, int]:
+    if is_collab_enabled(str(message.channel.id)):
+        return (message.channel.id, SHARED_ARTIFACT_OWNER_ID)
     return (message.channel.id, message.author.id)
 
 
@@ -428,6 +434,9 @@ def _working_artifacts(message: discord.Message) -> dict[str, str]:
     current = LAST_SOLVE_ARTIFACTS.get(key)
     if current is not None:
         return current
+
+    if key[1] == SHARED_ARTIFACT_OWNER_ID:
+        return LAST_SOLVE_ARTIFACTS.setdefault(key, {})
 
     fallback_key = _latest_artifact_key_for_user(message.author.id)
     if fallback_key is not None and fallback_key != key:
@@ -491,6 +500,12 @@ def _artifact_filename(current: dict[str, str], artifact_type: str) -> str:
     if artifact_type == "problem":
         return f"{_safe_pddl_name(current.get('problem_name', ''), 'problem')}.pddl"
     return "plan.txt"
+
+
+def _shared_log_content(message: discord.Message) -> str:
+    display_name = message.author.display_name.strip() or message.author.name
+    text = (message.content or "").strip()
+    return f"{display_name}: {text}"
 
 
 def _artifact_reply_text(current: dict[str, str], artifact_type: str) -> str:
@@ -993,7 +1008,7 @@ async def _run_validate_task_request(message: discord.Message) -> str:
 async def _run_autovalidate_request(
     message: discord.Message,
     max_iterations: int = 3,
-) -> tuple[str, list[discord.File]]:
+) -> tuple[str, list[discord.File] | None]:
     current = _working_artifacts(message)
     domain_text = _artifact_text(current, "domain")
     problem_text = _artifact_text(current, "problem")
@@ -1011,7 +1026,7 @@ async def _run_autovalidate_request(
     for iteration in range(1, max_iterations + 1):
         val_text = await validate_plan_with_val(working_domain, working_problem, plan_text)
         if _val_output_indicates_valid(val_text):
-            updated = _update_working_artifacts(
+            _update_working_artifacts(
                 message,
                 domain=working_domain,
                 problem=working_problem,
@@ -1019,15 +1034,9 @@ async def _run_autovalidate_request(
                 domain_name=domain_name,
                 problem_name=problem_name,
             )
-            files = [
-                _text_file(working_domain, _artifact_filename(updated, "domain")),
-                _text_file(working_problem, _artifact_filename(updated, "problem")),
-                _text_file(plan_text, _artifact_filename(updated, "plan")),
-                _text_file(val_text, "val.log"),
-            ]
             return (
                 f"VAL accepted the plan after {iteration} iteration(s).",
-                files,
+                None,
             )
 
         feedback = (
@@ -1256,16 +1265,18 @@ async def _run_edit_problem_request(message: discord.Message, instruction: str) 
     raise RuntimeError(retry_feedback or "Failed to revise the problem.")
 
 
-async def _run_edit_plan_request(message: discord.Message, instruction: str) -> tuple[str, list[discord.File]]:
+async def _run_edit_plan_request(
+    message: discord.Message, instruction: str
+) -> tuple[str, list[discord.File] | None]:
     current = _working_artifacts(message)
     current_plan = _artifact_text(current, "plan")
     if not current_plan:
         raise RuntimeError("No current plan to edit. Generate or plan something first.")
 
     revised_plan = await _llm_plan_edit_from_instruction(message, instruction, current_plan)
-    current = _update_working_artifacts(message, plan=revised_plan)
+    _update_working_artifacts(message, plan=revised_plan)
     reply_text = f"Updated plan:\n```text\n{revised_plan}\n```"
-    return reply_text, [_text_file(revised_plan, _artifact_filename(current, "plan"))]
+    return reply_text, None
 
 
 async def _run_undo_request(message: discord.Message, artifact_type: str) -> tuple[str, list[discord.File] | None]:
@@ -1288,8 +1299,7 @@ async def _run_undo_request(message: discord.Message, artifact_type: str) -> tup
         raise RuntimeError(f"No previous {artifact_type} version to restore.")
 
     reply_text = _artifact_reply_text(current, artifact_type)
-    files = [_text_file(_artifact_text(current, artifact_type), _artifact_filename(current, artifact_type))]
-    return reply_text, files
+    return reply_text, None
 
 
 async def _handle_workflow_request(message: discord.Message) -> bool:
@@ -1749,13 +1759,13 @@ async def setkey_cmd(interaction: discord.Interaction, provider: str, api_key: s
 
 @bot.event
 async def on_ready():
-    await connect_mcp_servers()
     saved_artifacts, saved_history = load_saved_working_artifacts()
     LAST_SOLVE_ARTIFACTS.clear()
     LAST_SOLVE_ARTIFACTS.update(saved_artifacts)
     ARTIFACT_HISTORY.clear()
     ARTIFACT_HISTORY.update(saved_history)
     print(f"Logged in as {bot.user} (id={bot.user.id})")
+    print("[MCP] Startup uses lazy MCP connections. Planning commands will connect on first use.")
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     synced = await bot.tree.sync(guild=guild)
@@ -1782,19 +1792,21 @@ async def _handle_conversation_message(message: discord.Message):
     if not text:
         return
 
+    collab_enabled = is_collab_enabled(str(message.channel.id))
     log_message(
         message.channel.id,
         message.author.id,
         "user",
-        text,
+        _shared_log_content(message) if collab_enabled else text,
         message.guild.id if message.guild else None,
     )
 
     async with message.channel.typing():
         context = get_recent_context(
-            user_id=message.author.id,
+            user_id=None if collab_enabled else message.author.id,
             guild_id=message.guild.id if message.guild else None,
             channel_id=message.channel.id,
+            shared=collab_enabled,
         )
         selected_model = get_user_model(str(message.author.id)) or MODEL
         try:
@@ -1827,7 +1839,10 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    if not is_chat_enabled(str(message.author.id), str(message.channel.id)):
+    channel_id = str(message.channel.id)
+    if not is_collab_enabled(channel_id) and not is_chat_enabled(
+        str(message.author.id), channel_id
+    ):
         return
 
     await _handle_conversation_message(message)
@@ -1893,6 +1908,35 @@ async def chat(ctx: commands.Context):
     )
 
 
+@bot.command()
+async def collab(ctx: commands.Context):
+    channel_id = str(ctx.channel.id)
+    enabled = not is_collab_enabled(channel_id)
+    set_collab_enabled(channel_id, enabled)
+
+    if enabled:
+        personal_key = (ctx.channel.id, ctx.author.id)
+        shared_key = (ctx.channel.id, SHARED_ARTIFACT_OWNER_ID)
+        if shared_key not in LAST_SOLVE_ARTIFACTS and personal_key in LAST_SOLVE_ARTIFACTS:
+            LAST_SOLVE_ARTIFACTS[shared_key] = {
+                k: str(v) for k, v in LAST_SOLVE_ARTIFACTS[personal_key].items()
+            }
+        if shared_key not in ARTIFACT_HISTORY and personal_key in ARTIFACT_HISTORY:
+            ARTIFACT_HISTORY[shared_key] = [
+                {k: str(v) for k, v in snapshot.items()}
+                for snapshot in ARTIFACT_HISTORY[personal_key]
+            ]
+        _persist_artifacts_if_session_saved()
+        await ctx.reply(
+            "Collaboration mode is now `on` in this channel. Everyone here can use shared chat context and work on the same domain, problem, and plan."
+        )
+        return
+
+    await ctx.reply(
+        "Collaboration mode is now `off` in this channel. Normal chat and planning artifacts are separate for each user again."
+    )
+
+
 @bot.command(name="plan")
 async def plan_cmd(ctx: commands.Context, *, request: str | None = None):
     async with ctx.typing():
@@ -1926,10 +1970,7 @@ async def domain_cmd(ctx: commands.Context, *, request: str | None = None):
             return
     reply_text = _format_domain_reply(domain_name, domain_text)
     messages = _split_discord_message(reply_text)
-    await ctx.reply(
-        messages[0],
-        file=_text_file(domain_text, f"{_safe_pddl_name(domain_name, 'domain')}.pddl"),
-    )
+    await ctx.reply(messages[0])
     for chunk in messages[1:]:
         await ctx.send(chunk)
 
@@ -1955,10 +1996,7 @@ async def problem_cmd(ctx: commands.Context, *, request: str | None = None):
             return
     reply_text = _format_problem_reply(problem_name, problem_text)
     messages = _split_discord_message(reply_text)
-    await ctx.reply(
-        messages[0],
-        file=_text_file(problem_text, f"{_safe_pddl_name(problem_name, 'problem')}.pddl"),
-    )
+    await ctx.reply(messages[0])
     for chunk in messages[1:]:
         await ctx.send(chunk)
 

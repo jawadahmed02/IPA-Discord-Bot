@@ -155,6 +155,11 @@ def init_db():
             PRIMARY KEY (user_id, channel_id)
         );
 
+        CREATE TABLE IF NOT EXISTS channel_collab_mode (
+            channel_id TEXT NOT NULL PRIMARY KEY,
+            collab_enabled INTEGER NOT NULL CHECK (collab_enabled IN (0, 1))
+        );
+
         CREATE TABLE IF NOT EXISTS saved_sessions (
             session_id TEXT PRIMARY KEY,
             saved_at TEXT NOT NULL
@@ -369,35 +374,57 @@ def load_saved_working_artifacts() -> tuple[dict[tuple[int, int], dict[str, str]
 
 
 def get_recent_context(
-    user_id: int,
+    user_id: int | None,
     guild_id: int | None,
     channel_id: int | None = None,
     limit: int = 1000,
+    shared: bool = False,
 ):
     con = _db_connect()
     cur = con.cursor()
-    cur.execute(
-        """
-        SELECT role, content, session_id, channel_id
-        FROM messages
-        WHERE user_id = ?
-          AND (
-                (? IS NULL AND guild_id IS NULL)
-                OR guild_id = ?
-              )
-        ORDER BY
-            CASE WHEN channel_id = ? THEN 0 ELSE 1 END,
-            id DESC
-        LIMIT ?
-        """,
-        (
-            str(user_id),
-            str(guild_id) if guild_id is not None else None,
-            str(guild_id) if guild_id is not None else None,
-            str(channel_id) if channel_id is not None else None,
-            limit,
-        ),
-    )
+    if shared:
+        cur.execute(
+            """
+            SELECT role, content, session_id, channel_id
+            FROM messages
+            WHERE channel_id = ?
+              AND (
+                    (? IS NULL AND guild_id IS NULL)
+                    OR guild_id = ?
+                  )
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (
+                str(channel_id) if channel_id is not None else None,
+                str(guild_id) if guild_id is not None else None,
+                str(guild_id) if guild_id is not None else None,
+                limit,
+            ),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT role, content, session_id, channel_id
+            FROM messages
+            WHERE user_id = ?
+              AND (
+                    (? IS NULL AND guild_id IS NULL)
+                    OR guild_id = ?
+                  )
+            ORDER BY
+                CASE WHEN channel_id = ? THEN 0 ELSE 1 END,
+                id DESC
+            LIMIT ?
+            """,
+            (
+                str(user_id),
+                str(guild_id) if guild_id is not None else None,
+                str(guild_id) if guild_id is not None else None,
+                str(channel_id) if channel_id is not None else None,
+                limit,
+            ),
+        )
     rows = cur.fetchall()
     con.close()
     rows.reverse()
@@ -531,6 +558,33 @@ def is_chat_enabled(user_id: str, channel_id: str) -> bool:
     row = cur.fetchone()
     con.close()
     return bool(row[0]) if row else True
+
+
+def is_collab_enabled(channel_id: str) -> bool:
+    con = _db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT collab_enabled FROM channel_collab_mode WHERE channel_id = ?",
+        (channel_id,),
+    )
+    row = cur.fetchone()
+    con.close()
+    return bool(row[0]) if row else False
+
+
+def set_collab_enabled(channel_id: str, enabled: bool):
+    con = _db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO channel_collab_mode (channel_id, collab_enabled)
+        VALUES (?, ?)
+        ON CONFLICT(channel_id) DO UPDATE SET collab_enabled=excluded.collab_enabled
+        """,
+        (channel_id, int(enabled)),
+    )
+    con.commit()
+    con.close()
 
 
 def set_chat_enabled(user_id: str, channel_id: str, enabled: bool):

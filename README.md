@@ -39,6 +39,7 @@ The bot currently supports:
 - planning requests from Discord attachments with `!plan`
 - natural-language `!plan`, `!domain`, and `!problem` flows that go through the local `l2p` MCP server before solving
 - artifact inspection and revision with `!show`, `!edit`, and `!undo`
+- shared channel collaboration with `!collab` for shared chat context and shared planning artifacts
 - plan, domain, task, and VAL-based validation flows with `!validate`, `!validate_domain`, `!validate_task`, and `!autovalidate`
 - thread creation, member lookup, and thread-add helper flows
 - session saving and provider-key sharing controls
