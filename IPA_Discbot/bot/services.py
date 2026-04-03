@@ -12,7 +12,6 @@ from discord.ext import commands
 
 from IPA_Discbot.mcp_client import (
     close_mcp_servers,
-    connect_mcp_servers,
     list_all_mcp_tools,
     get_mcp_tool_catalog,
     solve_pddl,
@@ -199,7 +198,7 @@ def _format_help_message() -> str:
         "`!problem <request>` Generate a planning problem from a natural-language request and return the problem PDDL.",
         "",
         "HITL Editing:",
-        "`!show <domain|problem|plan>` Show the current working artifact and return it as a file.",
+        "`!show <domain|problem|plan>` Show the current working artifact in chat.",
         "`!files` Send the current stored domain, problem, and plan as files.",
         "`!explain <domain|problem|plan>` Explain the current working artifact in normal language.",
         "`!edit <domain|problem|plan> <instruction>` Revise one current artifact while preserving the rest of the workflow state.",
@@ -1009,7 +1008,7 @@ async def _run_validate_task_request(message: discord.Message) -> str:
 async def _run_autovalidate_request(
     message: discord.Message,
     max_iterations: int = 3,
-) -> tuple[str, list[discord.File]]:
+) -> tuple[str, list[discord.File] | None]:
     current = _working_artifacts(message)
     domain_text = _artifact_text(current, "domain")
     problem_text = _artifact_text(current, "problem")
@@ -1027,7 +1026,7 @@ async def _run_autovalidate_request(
     for iteration in range(1, max_iterations + 1):
         val_text = await validate_plan_with_val(working_domain, working_problem, plan_text)
         if _val_output_indicates_valid(val_text):
-            updated = _update_working_artifacts(
+            _update_working_artifacts(
                 message,
                 domain=working_domain,
                 problem=working_problem,
@@ -1035,15 +1034,9 @@ async def _run_autovalidate_request(
                 domain_name=domain_name,
                 problem_name=problem_name,
             )
-            files = [
-                _text_file(working_domain, _artifact_filename(updated, "domain")),
-                _text_file(working_problem, _artifact_filename(updated, "problem")),
-                _text_file(plan_text, _artifact_filename(updated, "plan")),
-                _text_file(val_text, "val.log"),
-            ]
             return (
                 f"VAL accepted the plan after {iteration} iteration(s).",
-                files,
+                None,
             )
 
         feedback = (
@@ -1272,16 +1265,18 @@ async def _run_edit_problem_request(message: discord.Message, instruction: str) 
     raise RuntimeError(retry_feedback or "Failed to revise the problem.")
 
 
-async def _run_edit_plan_request(message: discord.Message, instruction: str) -> tuple[str, list[discord.File]]:
+async def _run_edit_plan_request(
+    message: discord.Message, instruction: str
+) -> tuple[str, list[discord.File] | None]:
     current = _working_artifacts(message)
     current_plan = _artifact_text(current, "plan")
     if not current_plan:
         raise RuntimeError("No current plan to edit. Generate or plan something first.")
 
     revised_plan = await _llm_plan_edit_from_instruction(message, instruction, current_plan)
-    current = _update_working_artifacts(message, plan=revised_plan)
+    _update_working_artifacts(message, plan=revised_plan)
     reply_text = f"Updated plan:\n```text\n{revised_plan}\n```"
-    return reply_text, [_text_file(revised_plan, _artifact_filename(current, "plan"))]
+    return reply_text, None
 
 
 async def _run_undo_request(message: discord.Message, artifact_type: str) -> tuple[str, list[discord.File] | None]:
@@ -1304,8 +1299,7 @@ async def _run_undo_request(message: discord.Message, artifact_type: str) -> tup
         raise RuntimeError(f"No previous {artifact_type} version to restore.")
 
     reply_text = _artifact_reply_text(current, artifact_type)
-    files = [_text_file(_artifact_text(current, artifact_type), _artifact_filename(current, artifact_type))]
-    return reply_text, files
+    return reply_text, None
 
 
 async def _handle_workflow_request(message: discord.Message) -> bool:
@@ -1765,13 +1759,13 @@ async def setkey_cmd(interaction: discord.Interaction, provider: str, api_key: s
 
 @bot.event
 async def on_ready():
-    await connect_mcp_servers()
     saved_artifacts, saved_history = load_saved_working_artifacts()
     LAST_SOLVE_ARTIFACTS.clear()
     LAST_SOLVE_ARTIFACTS.update(saved_artifacts)
     ARTIFACT_HISTORY.clear()
     ARTIFACT_HISTORY.update(saved_history)
     print(f"Logged in as {bot.user} (id={bot.user.id})")
+    print("[MCP] Startup uses lazy MCP connections. Planning commands will connect on first use.")
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     synced = await bot.tree.sync(guild=guild)
@@ -1976,10 +1970,7 @@ async def domain_cmd(ctx: commands.Context, *, request: str | None = None):
             return
     reply_text = _format_domain_reply(domain_name, domain_text)
     messages = _split_discord_message(reply_text)
-    await ctx.reply(
-        messages[0],
-        file=_text_file(domain_text, f"{_safe_pddl_name(domain_name, 'domain')}.pddl"),
-    )
+    await ctx.reply(messages[0])
     for chunk in messages[1:]:
         await ctx.send(chunk)
 
@@ -2005,10 +1996,7 @@ async def problem_cmd(ctx: commands.Context, *, request: str | None = None):
             return
     reply_text = _format_problem_reply(problem_name, problem_text)
     messages = _split_discord_message(reply_text)
-    await ctx.reply(
-        messages[0],
-        file=_text_file(problem_text, f"{_safe_pddl_name(problem_name, 'problem')}.pddl"),
-    )
+    await ctx.reply(messages[0])
     for chunk in messages[1:]:
         await ctx.send(chunk)
 
