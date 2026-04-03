@@ -1,8 +1,4 @@
-import asyncio
-import ast
-import difflib
 import io
-import json
 import re
 import traceback
 
@@ -38,14 +34,43 @@ from .llm_helpers import (
     _parse_solve_response_text,
     llm_reply,
 )
-from .config import (
-    ARTIFACT_HISTORY,
-    BOT_SESSION_ID,
-    GUILD_ID,
-    LAST_SOLVE_ARTIFACTS,
-    MODEL,
-    PENDING_MEMBER_CONFIRMATIONS,
-    bot,
+from .config import GUILD_ID, LAST_SOLVE_ARTIFACTS, MODEL, PENDING_MEMBER_CONFIRMATIONS, bot
+from .parsing import (
+    _collect_validation_text,
+    _detect_artifact_request,
+    _extract_domain_attachment,
+    _extract_pddl_attachments,
+    _extract_val_attachments,
+    _extract_validation_payload,
+    _member_name_variants,
+    _normalize_artifact_type,
+    _normalize_member_text,
+    _parse_loose_structured_text,
+    _pddl_from_l2p_payload,
+    _planner_output_indicates_failure,
+    _rank_matching_members,
+    _read_text_attachment,
+    _score_member_match,
+    _solve_output_has_action_steps,
+    _split_discord_message,
+    _summarize_validation_failure,
+    _truncate_discord_message,
+    _validation_indicates_valid,
+    _val_output_indicates_valid,
+)
+from .state import (
+    SHARED_ARTIFACT_OWNER_ID,
+    _artifact_text,
+    _copy_personal_artifacts_to_shared,
+    _latest_artifact_key_for_user,
+    _load_runtime_artifact_state,
+    _persist_artifacts_if_session_saved,
+    _push_artifact_history,
+    _restore_artifact_version,
+    _solve_artifacts_key,
+    _store_last_solve_artifacts,
+    _update_working_artifacts,
+    _working_artifacts,
 )
 from .storage import (
     get_share_mode,
@@ -56,7 +81,6 @@ from .storage import (
     load_saved_working_artifacts,
     log_message,
     save_current_session,
-    save_working_artifacts_snapshot,
     save_provider_key,
     set_collab_enabled,
     set_chat_enabled,
@@ -64,84 +88,6 @@ from .storage import (
     set_user_model,
     user_has_any_provider_key,
 )
-
-SHARED_ARTIFACT_OWNER_ID = 0
-
-
-def _truncate_discord_message(text: str, limit: int = 1900) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "..."
-
-
-def _split_discord_message(text: str, limit: int = 1900) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-
-    fenced_match = re.match(r"^([\s\S]*?)```([a-zA-Z0-9_-]*)\n([\s\S]*?)\n```$", text)
-    if fenced_match:
-        prefix = fenced_match.group(1).rstrip()
-        info = fenced_match.group(2)
-        body = fenced_match.group(3)
-        fence_open = f"```{info}\n"
-        fence_close = "\n```"
-
-        chunks: list[str] = []
-        body_lines = body.splitlines()
-        current_body: list[str] = []
-        current_prefix = prefix
-
-        for line in body_lines:
-            candidate_body = "\n".join(current_body + [line])
-            candidate = (
-                (current_prefix + "\n" if current_prefix else "")
-                + fence_open
-                + candidate_body
-                + fence_close
-            )
-            if current_body and len(candidate) > limit:
-                completed = (
-                    (current_prefix + "\n" if current_prefix else "")
-                    + fence_open
-                    + "\n".join(current_body)
-                    + fence_close
-                )
-                chunks.append(completed)
-                current_body = [line]
-                current_prefix = ""
-            else:
-                current_body.append(line)
-
-        if current_body:
-            completed = (
-                (current_prefix + "\n" if current_prefix else "")
-                + fence_open
-                + "\n".join(current_body)
-                + fence_close
-            )
-            chunks.append(completed)
-
-        if chunks:
-            return chunks
-
-    chunks: list[str] = []
-    current: list[str] = []
-    current_length = 0
-
-    for line in text.splitlines():
-        addition = len(line) + (1 if current else 0)
-        if current and current_length + addition > limit:
-            chunks.append("\n".join(current))
-            current = [line]
-            current_length = len(line)
-        else:
-            current.append(line)
-            current_length += addition
-
-    if current:
-        chunks.append("\n".join(current))
-
-    return chunks
 
 
 def _summarize_tool_description(description: str, limit: int = 80) -> str:
@@ -233,14 +179,6 @@ def _format_help_message() -> str:
     return "\n".join(lines)
 
 
-def _pddl_from_l2p_payload(payload: dict[str, object], *keys: str) -> str:
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
 def _format_pddl_reply(kind: str, name: str, text: str) -> str:
     title = f"Generated {kind} `{name}`:" if name else f"Generated {kind}:"
     stripped = text.strip()
@@ -272,229 +210,6 @@ def _text_file(text: str, filename: str) -> discord.File:
     return discord.File(io.BytesIO(text.encode("utf-8")), filename=filename)
 
 
-def _solve_output_has_action_steps(text: str) -> bool:
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if line.startswith("(") and line.endswith(")"):
-            return True
-    return False
-
-
-def _planner_output_indicates_failure(text: str) -> bool:
-    lowered = text.lower()
-    failure_markers = (
-        "driver aborting",
-        "translate exit code",
-        "search exit code",
-        "planner failed",
-        "unsolvable",
-        "error:",
-    )
-    return any(marker in lowered for marker in failure_markers)
-
-
-async def _read_text_attachment(attachment: discord.Attachment) -> str:
-    data = await attachment.read()
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError as e:
-        raise RuntimeError(f"{attachment.filename} is not valid UTF-8 text.") from e
-
-
-async def _extract_pddl_attachments(message: discord.Message) -> tuple[str, str]:
-    attachments = list(message.attachments)
-    if len(attachments) < 2:
-        raise RuntimeError("Attach both a domain PDDL file and a problem PDDL file.")
-
-    domain_text: str | None = None
-    problem_text: str | None = None
-
-    for attachment in attachments:
-        filename = attachment.filename.lower()
-        content = await _read_text_attachment(attachment)
-
-        if domain_text is None and "domain" in filename:
-            domain_text = content
-            continue
-
-        if problem_text is None and "problem" in filename:
-            problem_text = content
-
-    if domain_text is None or problem_text is None:
-        pddl_files = [
-            attachment
-            for attachment in attachments
-            if attachment.filename.lower().endswith((".pddl", ".txt"))
-        ]
-        if len(pddl_files) >= 2:
-            if domain_text is None:
-                domain_text = await _read_text_attachment(pddl_files[0])
-            if problem_text is None:
-                problem_text = await _read_text_attachment(pddl_files[1])
-
-    if domain_text is None or problem_text is None:
-        raise RuntimeError(
-            "Could not identify both files. Name them with `domain` and `problem`, "
-            "or attach exactly two PDDL text files."
-        )
-
-    return domain_text, problem_text
-
-
-async def _extract_val_attachments(message: discord.Message) -> tuple[str, str, str]:
-    attachments = list(message.attachments)
-    if len(attachments) < 3:
-        raise RuntimeError("Attach a domain file, a problem file, and a plan file.")
-
-    domain_text: str | None = None
-    problem_text: str | None = None
-    plan_text: str | None = None
-
-    for attachment in attachments:
-        filename = attachment.filename.lower()
-        content = await _read_text_attachment(attachment)
-
-        if domain_text is None and "domain" in filename:
-            domain_text = content
-            continue
-
-        if problem_text is None and "problem" in filename:
-            problem_text = content
-            continue
-
-        if plan_text is None and "plan" in filename:
-            plan_text = content
-
-    if domain_text is None or problem_text is None or plan_text is None:
-        text_files = [
-            attachment
-            for attachment in attachments
-            if attachment.filename.lower().endswith((".pddl", ".txt", ".plan", ".sol"))
-        ]
-        if len(text_files) >= 3:
-            contents: dict[str, str] = {}
-            for attachment in text_files[:3]:
-                contents[attachment.filename] = await _read_text_attachment(attachment)
-
-            ordered_contents = list(contents.values())
-            if domain_text is None:
-                domain_text = ordered_contents[0]
-            if problem_text is None:
-                problem_text = ordered_contents[1]
-            if plan_text is None:
-                plan_text = ordered_contents[2]
-
-    if domain_text is None or problem_text is None or plan_text is None:
-        raise RuntimeError(
-            "Could not identify all three files. Name them with `domain`, `problem`, and `plan`, "
-            "or attach exactly three text files in that order."
-        )
-
-    return domain_text, problem_text, plan_text
-
-
-async def _extract_domain_attachment(message: discord.Message) -> str:
-    attachments = list(message.attachments)
-    if not attachments:
-        raise RuntimeError("Attach a domain PDDL file.")
-
-    for attachment in attachments:
-        filename = attachment.filename.lower()
-        if "domain" in filename:
-            return await _read_text_attachment(attachment)
-
-    text_files = [
-        attachment
-        for attachment in attachments
-        if attachment.filename.lower().endswith((".pddl", ".txt"))
-    ]
-    if text_files:
-        return await _read_text_attachment(text_files[0])
-
-    raise RuntimeError("Could not identify a domain file.")
-
-
-def _solve_artifacts_key(message: discord.Message) -> tuple[int, int]:
-    if is_collab_enabled(str(message.channel.id)):
-        return (message.channel.id, SHARED_ARTIFACT_OWNER_ID)
-    return (message.channel.id, message.author.id)
-
-
-def _latest_artifact_key_for_user(user_id: int) -> tuple[int, int] | None:
-    for key in reversed(list(LAST_SOLVE_ARTIFACTS.keys())):
-        if key[1] != user_id:
-            continue
-        artifacts = LAST_SOLVE_ARTIFACTS.get(key, {})
-        if any(str(artifacts.get(name, "")).strip() for name in ("domain", "problem", "plan")):
-            return key
-    return None
-
-
-def _working_artifacts(message: discord.Message) -> dict[str, str]:
-    key = _solve_artifacts_key(message)
-    current = LAST_SOLVE_ARTIFACTS.get(key)
-    if current is not None:
-        return current
-
-    if key[1] == SHARED_ARTIFACT_OWNER_ID:
-        return LAST_SOLVE_ARTIFACTS.setdefault(key, {})
-
-    fallback_key = _latest_artifact_key_for_user(message.author.id)
-    if fallback_key is not None and fallback_key != key:
-        LAST_SOLVE_ARTIFACTS[key] = {
-            k: str(v) for k, v in LAST_SOLVE_ARTIFACTS.get(fallback_key, {}).items()
-        }
-        fallback_history = ARTIFACT_HISTORY.get(fallback_key, [])
-        if fallback_history:
-            ARTIFACT_HISTORY[key] = [
-                {k: str(v) for k, v in snapshot.items()} for snapshot in fallback_history
-            ]
-        return LAST_SOLVE_ARTIFACTS[key]
-
-    return LAST_SOLVE_ARTIFACTS.setdefault(key, {})
-
-
-def _persist_artifacts_if_session_saved() -> None:
-    save_working_artifacts_snapshot(
-        BOT_SESSION_ID,
-        LAST_SOLVE_ARTIFACTS,
-        ARTIFACT_HISTORY,
-    )
-
-
-def _push_artifact_history(message: discord.Message) -> None:
-    key = _solve_artifacts_key(message)
-    current = LAST_SOLVE_ARTIFACTS.get(key)
-    if not current:
-        return
-    snapshot = {k: str(v) for k, v in current.items()}
-    history = ARTIFACT_HISTORY.setdefault(key, [])
-    history.append(snapshot)
-    if len(history) > 10:
-        del history[:-10]
-
-
-def _update_working_artifacts(message: discord.Message, **updates: str) -> dict[str, str]:
-    current = _working_artifacts(message)
-    changed = False
-    for key, value in updates.items():
-        if value is None:
-            continue
-        value_str = str(value)
-        if current.get(key) != value_str:
-            changed = True
-    if changed and current:
-        _push_artifact_history(message)
-    current.update({k: str(v) for k, v in updates.items() if v is not None})
-    if changed:
-        _persist_artifacts_if_session_saved()
-    return current
-
-
-def _artifact_text(current: dict[str, str], artifact_type: str) -> str:
-    return str(current.get(artifact_type, "")).strip()
-
-
 def _artifact_filename(current: dict[str, str], artifact_type: str) -> str:
     if artifact_type == "domain":
         return f"{_safe_pddl_name(current.get('domain_name', ''), 'domain')}.pddl"
@@ -520,210 +235,12 @@ def _artifact_reply_text(current: dict[str, str], artifact_type: str) -> str:
     return f"Current plan:\n```text\n{text}\n```"
 
 
-def _val_output_indicates_valid(text: str) -> bool:
-    lowered = (text or "").strip().lower()
-    if not lowered:
-        return False
-    type_check_failure_patterns = (
-        r"type-?checking[^\n]*(?:error|failed|failure|invalid)",
-        r"type checking[^\n]*(?:error|failed|failure|invalid)",
-    )
-    positive_markers = (
-        "plan valid",
-        "plan executed successfully",
-        "successful plans:",
-        "plan verification result: valid",
-        "plan verification result: success",
-        "plan successfully validated",
-    )
-    negative_markers = (
-        "error:",
-        "unknown type",
-        "goal not satisfied",
-        "unsatisfied",
-        "invalid",
-        "failed",
-        "problem in domain definition",
-        "problem in problem definition",
-        "problem in plan definition",
-        "precondition",
-        "cannot be applied",
-        "violat",
-    )
-    if any(marker in lowered for marker in negative_markers):
-        return False
-    if any(re.search(pattern, text, re.IGNORECASE) for pattern in type_check_failure_patterns):
-        return False
-    return any(marker in lowered for marker in positive_markers)
-
-
-def _parse_loose_structured_text(text: str) -> dict | None:
-    stripped = (text or "").strip()
-    if not stripped or stripped[0] not in "{[":
-        return None
-    try:
-        decoded = json.loads(stripped)
-    except json.JSONDecodeError:
-        try:
-            decoded = ast.literal_eval(stripped)
-        except (ValueError, SyntaxError):
-            return None
-    return decoded if isinstance(decoded, dict) else None
-
-
-def _extract_validation_payload(raw: object) -> dict:
-    if isinstance(raw, dict):
-        payload = raw
-    else:
-        payload = _parse_loose_structured_text(str(raw)) or {}
-
-    while isinstance(payload.get("result"), dict):
-        payload = payload["result"]
-    return payload
-
-
-def _collect_validation_text(payload: dict) -> str:
-    texts: list[str] = []
-
-    def _add(value: object) -> None:
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped and stripped not in texts:
-                texts.append(stripped)
-
-    output = payload.get("output")
-    if isinstance(output, dict):
-        for key in ("val.log", "pddl_domain.log", "pddl_problem.log", "pddl_plan.log", "stdout", "stderr"):
-            _add(output.get(key))
-        for key, value in output.items():
-            if key not in {"val.log", "pddl_domain.log", "pddl_problem.log", "pddl_plan.log", "stdout", "stderr"}:
-                _add(value)
-    else:
-        _add(output)
-
-    for key in ("stdout", "stderr", "error"):
-        _add(payload.get(key))
-
-    raw = payload.get("raw")
-    if isinstance(raw, dict):
-        nested = raw.get("result")
-        if isinstance(nested, dict):
-            for key in ("output", "stdout", "stderr", "error"):
-                value = nested.get(key)
-                if isinstance(value, dict):
-                    for subkey in ("val.log", "pddl_domain.log", "pddl_problem.log", "pddl_plan.log", "stdout", "stderr"):
-                        _add(value.get(subkey))
-                    for _, subvalue in value.items():
-                        _add(subvalue)
-                else:
-                    _add(value)
-
-    return "\n\n".join(texts).strip()
-
-
-def _summarize_validation_failure(details: str) -> str:
-    text = (details or "").strip()
-    if not text:
-        return ""
-
-    type_check_failure_patterns = (
-        r"type-?checking[^\n]*(?:error|failed|failure|invalid)[^\n]*",
-        r"type checking[^\n]*(?:error|failed|failure|invalid)[^\n]*",
-    )
-    precondition_failure_patterns = (
-        r"precondition[^\n]*not satisfied[^\n]*",
-        r"precondition[^\n]*is false[^\n]*",
-        r"precondition[^\n]*failed[^\n]*",
-        r"failed precondition[^\n]*",
-    )
-    priority_patterns = (
-        r"pddl\.[A-Za-z0-9_.]*Error:\s*[^\n]+",
-        r"[A-Za-z0-9_.]*Error:\s*[^\n]+",
-        r"problem in (?:domain|problem|plan) definition[^\n]*",
-        r"unknown type[^\n]*",
-        *type_check_failure_patterns,
-        r"goal not satisfied[^\n]*",
-        r"cannot be applied[^\n]*",
-        *precondition_failure_patterns,
-    )
-    for pattern in priority_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(0).strip()
-
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("("):
-            continue
-        if stripped.startswith("File "):
-            continue
-        if stripped.lower().startswith("traceback"):
-            continue
-        if stripped.startswith("```"):
-            continue
-        return stripped
-
-    return ""
-
-
 def _validation_kind_labels(kind: str) -> tuple[str, str]:
     if kind == "domain":
         return ("Domain", "domain")
     if kind == "task":
         return ("Task", "task")
     return ("Plan", "plan")
-
-
-def _validation_indicates_valid(kind: str, raw: object) -> bool:
-    payload = _extract_validation_payload(raw)
-    text = _collect_validation_text(payload) or str(raw or "")
-    lowered = text.lower()
-
-    type_check_failure_patterns = (
-        r"type-?checking[^\n]*(?:error|failed|failure|invalid)",
-        r"type checking[^\n]*(?:error|failed|failure|invalid)",
-    )
-    common_negative_markers = (
-        "error:",
-        "unknown type",
-        "invalid",
-        "failed",
-        "problem in domain definition",
-        "problem in problem definition",
-        "problem in plan definition",
-        "violat",
-        "timed out",
-        "timeout",
-    )
-    plan_negative_markers = (
-        "goal not satisfied",
-        "unsatisfied",
-        "cannot be applied",
-    )
-    plan_negative_patterns = (
-        r"precondition[^\n]*not satisfied",
-        r"precondition[^\n]*is false",
-        r"precondition[^\n]*failed",
-        r"failed precondition",
-    )
-
-    negative_markers = common_negative_markers + (plan_negative_markers if kind == "plan" else ())
-    if any(marker in lowered for marker in negative_markers):
-        return False
-    if any(re.search(pattern, text, re.IGNORECASE) for pattern in type_check_failure_patterns):
-        return False
-    if kind == "plan" and any(re.search(pattern, text, re.IGNORECASE) for pattern in plan_negative_patterns):
-        return False
-
-    status = str(payload.get("status", "")).strip().lower()
-    if status == "ok":
-        return True
-
-    if kind == "plan":
-        return _val_output_indicates_valid(text)
-    return False
 
 
 def _format_validation_result(kind: str, raw: object) -> str:
@@ -752,27 +269,6 @@ def _format_validation_result(kind: str, raw: object) -> str:
         message += f"\n\nCheck URL: {check_url}"
 
     return _truncate_discord_message(message)
-
-
-def _store_last_solve_artifacts(
-    message: discord.Message,
-    domain_text: str,
-    problem_text: str,
-    plan_text: str,
-    domain_name: str,
-    problem_name: str,
-    **extra_artifacts: str,
-) -> None:
-    artifacts = {
-        "domain": domain_text,
-        "problem": problem_text,
-        "plan": plan_text,
-        "domain_name": domain_name,
-        "problem_name": problem_name,
-    }
-    artifacts.update({k: str(v) for k, v in extra_artifacts.items() if v is not None})
-    LAST_SOLVE_ARTIFACTS[_solve_artifacts_key(message)] = artifacts
-    _persist_artifacts_if_session_saved()
 
 
 async def _update_domain_with_fallback(
@@ -1152,49 +648,6 @@ async def _run_autovalidate_request(
     raise RuntimeError(
         f"VAL still rejected the plan after {max_iterations} iteration(s).\n\nLast VAL output:\n{val_text}"
     )
-
-
-def _normalize_artifact_type(raw: str) -> str | None:
-    value = raw.strip().lower()
-    if value in {"domain", "problem", "plan"}:
-        return value
-    return None
-
-
-def _detect_artifact_request(text: str) -> tuple[str, str, str] | None:
-    normalized = " ".join((text or "").strip().split())
-    lowered = normalized.lower()
-    show_match = re.match(r"^(show|display)\s+(the\s+)?(domain|problem|plan)\b", lowered)
-    if show_match:
-        artifact_type = show_match.group(3)
-        return ("show", artifact_type, "")
-
-    undo_match = re.match(r"^(undo|revert|restore)\s+(the\s+)?(domain|problem)\b", lowered)
-    if undo_match:
-        artifact_type = undo_match.group(3)
-        return ("undo", artifact_type, "")
-
-    edit_match = re.match(
-        r"^(edit|change|update|fix|revise)\s+(the\s+)?(domain|problem|plan)\b[:\s,-]*(.*)$",
-        normalized,
-        re.IGNORECASE,
-    )
-    if edit_match:
-        artifact_type = edit_match.group(3).lower()
-        instruction = edit_match.group(4).strip()
-        return ("edit", artifact_type, instruction)
-
-    for artifact_type in ("domain", "problem", "plan"):
-        if artifact_type not in lowered:
-            continue
-        if any(
-            marker in lowered
-            for marker in ("don't like", "do not like", "should", "needs to", "must", "wrong")
-        ):
-            return ("edit", artifact_type, normalized)
-    return None
-
-
 async def _run_show_artifact_request(
     message: discord.Message, artifact_type: str
 ) -> tuple[str, list[discord.File] | None]:
@@ -1329,24 +782,7 @@ async def _run_edit_plan_request(
 
 
 async def _run_undo_request(message: discord.Message, artifact_type: str) -> tuple[str, list[discord.File] | None]:
-    key = _solve_artifacts_key(message)
-    history = ARTIFACT_HISTORY.get(key, [])
-    if not history:
-        raise RuntimeError("No previous artifact version to restore.")
-
-    current = _working_artifacts(message)
-    restored_index = None
-    for index in range(len(history) - 1, -1, -1):
-        snapshot = history[index]
-        if _artifact_text(snapshot, artifact_type):
-            restored_index = index
-            current.update(snapshot)
-            del history[index:]
-            _persist_artifacts_if_session_saved()
-            break
-    if restored_index is None:
-        raise RuntimeError(f"No previous {artifact_type} version to restore.")
-
+    current = _restore_artifact_version(message, artifact_type)
     reply_text = _artifact_reply_text(current, artifact_type)
     return reply_text, None
 
@@ -1454,75 +890,6 @@ async def _handle_workflow_request(message: discord.Message) -> bool:
     for chunk in messages[1:]:
         await message.channel.send(chunk)
     return True
-
-
-def _normalize_member_text(value: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", value.lower())).strip()
-
-
-def _member_name_variants(member: discord.Member) -> list[str]:
-    variants = [member.display_name, member.name]
-    global_name = getattr(member, "global_name", None)
-    if global_name:
-        variants.append(global_name)
-    return [variant for variant in variants if variant]
-
-
-def _score_member_match(query: str, member: discord.Member) -> float:
-    normalized_query = _normalize_member_text(query)
-    if not normalized_query:
-        return 0.0
-
-    best_score = 0.0
-    query_tokens = set(normalized_query.split())
-
-    for variant in _member_name_variants(member):
-        normalized_variant = _normalize_member_text(variant)
-        if not normalized_variant:
-            continue
-
-        ratio = difflib.SequenceMatcher(None, normalized_query, normalized_variant).ratio()
-        token_overlap = len(query_tokens & set(normalized_variant.split()))
-        token_bonus = 0.12 * token_overlap
-        substring_bonus = (
-            0.2
-            if normalized_query in normalized_variant or normalized_variant in normalized_query
-            else 0.0
-        )
-        prefix_bonus = 0.08 if normalized_variant.startswith(normalized_query) else 0.0
-
-        best_score = max(best_score, ratio + token_bonus + substring_bonus + prefix_bonus)
-
-    return best_score
-
-
-async def _rank_matching_members(guild: discord.Guild, query: str) -> list[discord.Member]:
-    exact_member = guild.get_member_named(query)
-    if exact_member is not None:
-        return [exact_member]
-
-    members = list(guild.members)
-    if not members:
-        try:
-            members = [member async for member in guild.fetch_members(limit=None)]
-        except discord.HTTPException:
-            return []
-
-    scored_members: list[tuple[float, discord.Member]] = []
-    for member in members:
-        score = _score_member_match(query, member)
-        if score >= 0.45:
-            scored_members.append((score, member))
-
-    scored_members.sort(
-        key=lambda item: (
-            -item[0],
-            len(_normalize_member_text(item[1].display_name or item[1].name)),
-        )
-    )
-    return [member for _, member in scored_members]
-
-
 async def _handle_member_confirmation_response(message: discord.Message) -> bool:
     key = (message.channel.id, message.author.id)
     pending = PENDING_MEMBER_CONFIRMATIONS.get(key)
@@ -1809,10 +1176,7 @@ async def setkey_cmd(interaction: discord.Interaction, provider: str, api_key: s
 @bot.event
 async def on_ready():
     saved_artifacts, saved_history = load_saved_working_artifacts()
-    LAST_SOLVE_ARTIFACTS.clear()
-    LAST_SOLVE_ARTIFACTS.update(saved_artifacts)
-    ARTIFACT_HISTORY.clear()
-    ARTIFACT_HISTORY.update(saved_history)
+    _load_runtime_artifact_state(saved_artifacts, saved_history)
     print(f"Logged in as {bot.user} (id={bot.user.id})")
     print("[MCP] Startup uses lazy MCP connections. Planning commands will connect on first use.")
     guild = discord.Object(id=GUILD_ID)
@@ -1964,18 +1328,7 @@ async def collab(ctx: commands.Context):
     set_collab_enabled(channel_id, enabled)
 
     if enabled:
-        personal_key = (ctx.channel.id, ctx.author.id)
-        shared_key = (ctx.channel.id, SHARED_ARTIFACT_OWNER_ID)
-        if shared_key not in LAST_SOLVE_ARTIFACTS and personal_key in LAST_SOLVE_ARTIFACTS:
-            LAST_SOLVE_ARTIFACTS[shared_key] = {
-                k: str(v) for k, v in LAST_SOLVE_ARTIFACTS[personal_key].items()
-            }
-        if shared_key not in ARTIFACT_HISTORY and personal_key in ARTIFACT_HISTORY:
-            ARTIFACT_HISTORY[shared_key] = [
-                {k: str(v) for k, v in snapshot.items()}
-                for snapshot in ARTIFACT_HISTORY[personal_key]
-            ]
-        _persist_artifacts_if_session_saved()
+        _copy_personal_artifacts_to_shared(ctx.channel.id, ctx.author.id)
         await ctx.reply(
             "Collaboration mode is now `on` in this channel. Everyone here can use shared chat context and work on the same domain, problem, and plan."
         )
@@ -2313,11 +1666,7 @@ async def share(ctx: commands.Context):
 @bot.command()
 async def save(ctx: commands.Context):
     is_new_save = save_current_session()
-    save_working_artifacts_snapshot(
-        BOT_SESSION_ID,
-        LAST_SOLVE_ARTIFACTS,
-        ARTIFACT_HISTORY,
-    )
+    _persist_artifacts_if_session_saved()
     if is_new_save:
         await ctx.reply("Saved the current bot session. Its conversation log will be kept after restart.")
         return
