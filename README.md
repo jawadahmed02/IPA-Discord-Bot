@@ -1,9 +1,9 @@
-# Demonstration
-[![User demo video](https://cdn.loom.com/sessions/thumbnails/7c9f8f98e8f44776b55249da51d1f004-64bc52969c2346b5-full-play.gif#t=0.1)](https://www.loom.com/share/7c9f8f98e8f44776b55249da51d1f004)
-
 # Interactive Planning Agent Discord Bot
 
 The `Interactive Planning Agent Discord Bot` is a Discord-based interactive planning assistant. It combines a conversational bot, persistent user context, model selection through the `llm` Python package, and MCP-backed planning services so users can move between natural-language requests and planning tools inside Discord.
+
+# Demonstration
+[![User demo video](https://cdn.loom.com/sessions/thumbnails/7c9f8f98e8f44776b55249da51d1f004-64bc52969c2346b5-full-play.gif#t=0.1)](https://www.loom.com/share/7c9f8f98e8f44776b55249da51d1f004)
 
 ## Repository Layout
 
