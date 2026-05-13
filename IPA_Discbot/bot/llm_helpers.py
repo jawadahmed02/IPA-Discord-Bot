@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import re
 import threading
 
@@ -11,6 +10,7 @@ from IPA_Discbot.mcp_client import (
     L2P_DOMAIN_TOOL,
     L2P_TASK_TOOL,
     get_mcp_tool_catalog,
+    parse_solve_response_text as _parse_solve_response_text,
 )
 from .config import MODEL
 from .storage import get_effective_provider_key, get_user_model
@@ -61,55 +61,6 @@ def _json_repair_system_prompt() -> str:
         "Return exactly one valid JSON object and nothing else. "
         "Preserve the original intended fields and values when possible."
     )
-
-
-def _parse_solve_response_text(text: str) -> str:
-    try:
-        payload = _parse_llm_json_object(text)
-    except ValueError:
-        return text.strip()
-    except json.JSONDecodeError:
-        return text.strip()
-
-    output = payload.get("output")
-    if isinstance(output, dict):
-        sas_plan = output.get("sas_plan")
-        if isinstance(sas_plan, str) and sas_plan.strip():
-            return sas_plan.strip()
-
-    result = payload.get("result")
-    if isinstance(result, dict):
-        result_output = result.get("output")
-        if isinstance(result_output, dict):
-            sas_plan = result_output.get("sas_plan")
-            if isinstance(sas_plan, str) and sas_plan.strip():
-                return sas_plan.strip()
-
-        result_error = result.get("error")
-        if isinstance(result_error, str) and result_error.strip():
-            return result_error.strip()
-
-        result_stdout = result.get("stdout")
-        if isinstance(result_stdout, str) and result_stdout.strip():
-            return result_stdout.strip()
-
-    error = payload.get("error")
-    if isinstance(error, str) and error.strip():
-        return error.strip()
-
-    stdout = payload.get("stdout")
-    if isinstance(stdout, str) and stdout.strip():
-        return stdout.strip()
-
-    raw = payload.get("raw")
-    if isinstance(raw, dict):
-        raw_result = raw.get("result")
-        if isinstance(raw_result, dict):
-            raw_stdout = raw_result.get("stdout")
-            if isinstance(raw_stdout, str) and raw_stdout.strip():
-                return raw_stdout.strip()
-
-    return text.strip()
 
 
 def _join_natural(items: list[str]) -> str:
@@ -245,14 +196,17 @@ def _llm_reply_sync(model_id: str, context_messages: list[dict]) -> str:
     return response.text().strip()
 
 
-LLM_ENV_LOCK = threading.Lock()
+# One lock per model ID keeps concurrent requests from different users from racing
+# on the same model instance's .key attribute.
+_MODEL_LOCKS: dict[str, threading.Lock] = {}
+_MODEL_LOCKS_LOCK = threading.Lock()
 
-PROVIDER_ENV = {
-    "openai": "OPENAI_API_KEY",
-    "gemini": "LLM_GEMINI_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "ollama": None,
-}
+
+def _get_model_lock(model_id: str) -> threading.Lock:
+    with _MODEL_LOCKS_LOCK:
+        if model_id not in _MODEL_LOCKS:
+            _MODEL_LOCKS[model_id] = threading.Lock()
+        return _MODEL_LOCKS[model_id]
 
 
 def _provider_from_model_id(model_id: str) -> str | None:
@@ -266,83 +220,51 @@ def _provider_from_model_id(model_id: str) -> str | None:
     return "openai"
 
 
-def _run_llm_prompt_for_user_sync(
-    user_id: str, model_id: str, prompt: str, system_prompt: str
-) -> str:
+def _resolve_user_key(user_id: str, model_id: str) -> str | None:
     provider = _provider_from_model_id(model_id)
-    env_key = PROVIDER_ENV.get(provider or "")
+    if provider == "ollama":
+        return None
+    user_key, _ = get_effective_provider_key(user_id, provider)
+    if not user_key:
+        raise RuntimeError(
+            f"No API key available for {provider}. Use /setkey {provider} <key>, "
+            "or have someone enable !share for that provider."
+        )
+    return user_key
 
-    user_key = None
-    if env_key:
-        user_key, _ = get_effective_provider_key(user_id, provider)
-        if not user_key:
-            raise RuntimeError(
-                f"No API key available for {provider}. Use /setkey {provider} <key>, "
-                "or have someone enable !share for that provider."
-            )
 
-    with LLM_ENV_LOCK:
-        old = os.environ.get(env_key) if env_key else None
+def _call_model_sync(model_id: str, user_key: str | None, prompt: str, system_prompt: str) -> str:
+    lock = _get_model_lock(model_id)
+    with lock:
+        model = llm.get_model(model_id)
+        original_key = getattr(model, "key", None)
         try:
-            if env_key and user_key:
-                os.environ[env_key] = user_key
-
-            model = llm.get_model(model_id)
+            if user_key is not None:
+                model.key = user_key
             response = model.prompt(prompt, system=system_prompt)
             return response.text().strip()
         finally:
-            if env_key:
-                if old is None:
-                    os.environ.pop(env_key, None)
-                else:
-                    os.environ[env_key] = old
+            model.key = original_key
+
+
+def _run_llm_prompt_for_user_sync(
+    user_id: str, model_id: str, prompt: str, system_prompt: str
+) -> str:
+    user_key = _resolve_user_key(user_id, model_id)
+    return _call_model_sync(model_id, user_key, prompt, system_prompt)
 
 
 def _run_llm_for_user_sync(
     user_id: str, model_id: str, context_messages: list[dict]
 ) -> str:
-    provider = _provider_from_model_id(model_id)
-    env_key = PROVIDER_ENV.get(provider or "")
-
+    user_key = _resolve_user_key(user_id, model_id)
     transcript = _build_transcript(context_messages)
-    system_prompt = _conversation_system_prompt()
-
-    user_key = None
-    if env_key:
-        user_key, _ = get_effective_provider_key(user_id, provider)
-        if not user_key:
-            raise RuntimeError(
-                f"No API key available for {provider}. Use /setkey {provider} <key>, "
-                "or have someone enable !share for that provider."
-            )
-
-    with LLM_ENV_LOCK:
-        old = os.environ.get(env_key) if env_key else None
-        try:
-            if env_key and user_key:
-                os.environ[env_key] = user_key
-
-            model = llm.get_model(model_id)
-            resp = model.prompt(transcript, system=system_prompt)
-            return resp.text().strip()
-        finally:
-            if env_key:
-                if old is None:
-                    os.environ.pop(env_key, None)
-                else:
-                    os.environ[env_key] = old
+    return _call_model_sync(model_id, user_key, transcript, _conversation_system_prompt())
 
 
 async def llm_reply(
     model_id: str, context_messages: list[dict], user_id: str | None = None
 ) -> str:
-    print("========== MODEL DEBUG ==========")
-    print("User ID:", user_id)
-    print("DB model:", get_user_model(user_id) if user_id else None)
-    print("Passed model_id:", model_id)
-    print("Fallback MODEL constant:", MODEL)
-    print("=================================")
-
     if user_id is None:
         return await asyncio.to_thread(_llm_reply_sync, model_id, context_messages)
     return await asyncio.to_thread(

@@ -10,6 +10,7 @@ from .config import (
     mcp_server_url,
 )
 from .manager import close_mcp_servers, connect_mcp_servers
+from .parsing import parse_solve_response_text
 from .services import (
     get_mcp_tool_catalog,
     list_all_mcp_tools,

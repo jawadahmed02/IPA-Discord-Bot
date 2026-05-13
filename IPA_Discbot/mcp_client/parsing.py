@@ -117,6 +117,51 @@ def require_dict_payload(tool_name: str, payload: Any) -> dict[str, Any]:
     )
 
 
+def parse_solve_response_text(text: str) -> str:
+    try:
+        payload = json.loads(text[text.find("{") : text.rfind("}") + 1])
+    except (ValueError, json.JSONDecodeError):
+        return text.strip()
+
+    output = payload.get("output")
+    if isinstance(output, dict):
+        sas_plan = output.get("sas_plan")
+        if isinstance(sas_plan, str) and sas_plan.strip():
+            return sas_plan.strip()
+
+    result = payload.get("result")
+    if isinstance(result, dict):
+        result_output = result.get("output")
+        if isinstance(result_output, dict):
+            sas_plan = result_output.get("sas_plan")
+            if isinstance(sas_plan, str) and sas_plan.strip():
+                return sas_plan.strip()
+        result_error = result.get("error")
+        if isinstance(result_error, str) and result_error.strip():
+            return result_error.strip()
+        result_stdout = result.get("stdout")
+        if isinstance(result_stdout, str) and result_stdout.strip():
+            return result_stdout.strip()
+
+    error = payload.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+
+    stdout = payload.get("stdout")
+    if isinstance(stdout, str) and stdout.strip():
+        return stdout.strip()
+
+    raw = payload.get("raw")
+    if isinstance(raw, dict):
+        raw_result = raw.get("result")
+        if isinstance(raw_result, dict):
+            raw_stdout = raw_result.get("stdout")
+            if isinstance(raw_stdout, str) and raw_stdout.strip():
+                return raw_stdout.strip()
+
+    return text.strip()
+
+
 def format_tool_list(tool_names: tuple[str, ...]) -> str:
     names = [f"`{tool_name}`" for tool_name in tool_names]
     if not names:

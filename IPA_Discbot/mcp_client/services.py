@@ -1,3 +1,4 @@
+import time
 from typing import Any
 
 from .config import (
@@ -21,10 +22,13 @@ from .parsing import (
     require_dict_payload,
 )
 
+_CATALOG_TTL_SECONDS = 300  # re-fetch after 5 minutes
+
 _MCP_TOOL_CATALOG: dict[MCPServerName, list[dict[str, Any]]] = {
     "paas": [],
     "l2p": [],
 }
+_catalog_fetched_at: float = 0.0
 
 
 async def solve_pddl(domain: str, problem: str, timeout_s: int = 30) -> str:
@@ -199,11 +203,12 @@ async def list_all_mcp_tools() -> dict[MCPServerName, list[dict[str, str]]]:
 
 
 async def refresh_mcp_tool_catalog() -> dict[MCPServerName, list[dict[str, Any]]]:
-    global _MCP_TOOL_CATALOG
+    global _MCP_TOOL_CATALOG, _catalog_fetched_at
     _MCP_TOOL_CATALOG = {
         "paas": [dict(tool) for tool in await list_mcp_tools("paas")],
         "l2p": [dict(tool) for tool in await list_mcp_tools("l2p")],
     }
+    _catalog_fetched_at = time.monotonic()
     return {
         server: [dict(tool) for tool in tools]
         for server, tools in _MCP_TOOL_CATALOG.items()
@@ -211,7 +216,9 @@ async def refresh_mcp_tool_catalog() -> dict[MCPServerName, list[dict[str, Any]]
 
 
 async def get_mcp_tool_catalog() -> dict[MCPServerName, list[dict[str, Any]]]:
-    if any(_MCP_TOOL_CATALOG[server] for server in _MCP_TOOL_CATALOG):
+    catalog_is_populated = any(_MCP_TOOL_CATALOG[server] for server in _MCP_TOOL_CATALOG)
+    catalog_is_fresh = (time.monotonic() - _catalog_fetched_at) < _CATALOG_TTL_SECONDS
+    if catalog_is_populated and catalog_is_fresh:
         return {
             server: [dict(tool) for tool in tools]
             for server, tools in _MCP_TOOL_CATALOG.items()
